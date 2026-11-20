@@ -18,6 +18,7 @@ import {
   type AdapterId,
   type AdapterEventRef,
   type ArchiveAppendResponse,
+  type BootId,
   type PersonaId,
   type RequestNonce,
   type SourceId,
@@ -38,7 +39,14 @@ import {
   type Store,
   type Tx,
 } from '@soul-harness/persistence';
-import { allocatePersonaId, allocateSessionId } from '@soul-harness/runtime';
+import {
+  allocatePersonaId,
+  allocateSessionId,
+  createPersonaLifecycle,
+  type PersonaLifecycle,
+  type PersonaSnapshot,
+  type RuntimeLogger,
+} from '@soul-harness/runtime';
 
 export const personaId: PersonaId = 'psn_01JQ8Z3K5M7P9R2T4V6X8Z0ABC' as PersonaId;
 
@@ -106,4 +114,36 @@ export const sessionIsNotPersona: PersonaId = allocateSessionId({
 export const callerSuppliedId: PersonaId = allocatePersonaId({
   // @ts-expect-error callers cannot choose an internal identifier
   id: 'psn_01JQ8Z3K5M7P9R2T4V6X8Z0ABC',
+});
+
+// --- runtime: SH-008B publishes the in-process persona lifecycle -------------
+
+const consumerLogger: RuntimeLogger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
+export const personas: PersonaLifecycle = createPersonaLifecycle({
+  store,
+  logger: consumerLogger,
+  bootId: 'consumer-boot' as BootId,
+});
+
+export const createdPersona: Promise<PersonaSnapshot> = personas.createPersona({
+  displayName: 'Consumer',
+});
+
+export const chosenPersona: Promise<PersonaSnapshot> = personas.createPersona({
+  displayName: 'Consumer',
+  // @ts-expect-error callers cannot choose a persona id
+  id: personaId,
+});
+
+export const badBoot: PersonaLifecycle = createPersonaLifecycle({
+  store,
+  logger: consumerLogger,
+  // @ts-expect-error bootId is a BootId, not a number
+  bootId: 1,
 });

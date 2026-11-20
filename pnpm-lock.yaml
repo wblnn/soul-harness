@@ -76,6 +76,9 @@ importers:
       '@soul-harness/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@soul-harness/persistence':
+        specifier: workspace:*
+        version: link:../persistence
     devDependencies:
       '@types/node':
         specifier: ^24.19.2

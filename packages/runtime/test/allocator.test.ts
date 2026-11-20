@@ -561,7 +561,7 @@ describe('allocator — sqlite primary key backstop', () => {
 });
 
 describe('allocator — surface and purity', () => {
-  it('exports only the allocator, not a persona machine or an event bus', async () => {
+  it('exports the allocator and the persona lifecycle, not later runtime surfaces', async () => {
     const exported = new Set(Object.keys(await import('../src/index.js')));
     expect(exported.has('createRuntime')).toBe(false);
     expect(exported.has('acceptStimulus')).toBe(false);
@@ -570,6 +570,7 @@ describe('allocator — surface and purity', () => {
     expect(exported.has('checkpointAll')).toBe(false);
     expect(exported.has('allocatePersonaId')).toBe(true);
     expect(exported.has('allocateConflictRecordId')).toBe(true);
+    expect(exported.has('createPersonaLifecycle')).toBe(true);
   });
 
   it('does not touch the filesystem, sqlite, or the environment from src', () => {
@@ -596,8 +597,12 @@ describe('allocator — surface and purity', () => {
         const allowed =
           specifier.startsWith('.') ||
           specifier === 'node:crypto' ||
-          specifier === '@soul-harness/contracts';
+          specifier === '@soul-harness/contracts' ||
+          specifier === '@soul-harness/persistence';
         expect(allowed, `${file} imports ${specifier}`).toBe(true);
+      }
+      for (const verb of ['SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'PRAGMA ']) {
+        expect(source.includes(verb), `${file} contains ${verb}`).toBe(false);
       }
     }
   });

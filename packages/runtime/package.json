@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Soul Harness runtime. SH-008A delivers identifier allocation only: no persona lifecycle, event bus, scheduler, or database access.",
+  "description": "Soul Harness runtime. SH-008A allocates identifiers. SH-008B manages in-process persona lifecycle through persistence. No event bus, scheduler, checkpoint orchestration, or HTTP.",
   "type": "module",
   "engines": {
     "node": ">=24.15.0 <25"
@@ -27,7 +27,8 @@
     "check": "tsc -p tsconfig.json --noEmit && vitest run"
   },
   "dependencies": {
-    "@soul-harness/contracts": "workspace:*"
+    "@soul-harness/contracts": "workspace:*",
+    "@soul-harness/persistence": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.19.2"

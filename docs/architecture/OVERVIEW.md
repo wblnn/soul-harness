@@ -1,7 +1,7 @@
 # OVERVIEW — Soul Harness 总体架构
 
 - **地位**：本文件与 `TRUST-BOUNDARIES.md`、`DATA-MODEL.md`、`RUNTIME-LIFECYCLE.md`、`MODULES.md`、`IDENTITY-PROTOCOL.md`、`AI-DEVELOPMENT-RULES.md` 共同构成**唯一架构基线**。
-- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配、`runtime` 的 ID 分配器）；认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
+- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配、`runtime` 的 ID 分配器与进程内 Persona 生命周期）；认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
 - **上位决策**：`docs/adr/ADR-001-independent-runtime.md`
 
 ---
@@ -135,9 +135,9 @@ Soul Harness 是一个**独立常驻的认知运行时**：人格身份、主观
 | Monorepo 骨架 | **已实现**（SH-005） |
 | `contracts` | **已实现（协议层，SH-004）**：类型与 10 份已注册 Schema。不生成 ID，无 IO |
 | `persistence` | **已实现（SH-006A–D）**：连接、WAL 模式、单写入事务、Migration、字段映射、Runtime checkpoint envelope 存取。不执行显式 `PRAGMA wal_checkpoint`，不重建 Runtime |
-| `runtime` | **部分实现（SH-008A）**：ID 分配器，测试见 `packages/runtime/test/`。不恢复人格、不跑事件总线或调度器，Daemon 未装配 |
+| `runtime` | **部分实现（SH-008A–B）**：ID 分配器与进程内 Persona 生命周期，测试见 `packages/runtime/test/`。不跑事件总线或调度器，不装载/写出检查点，Daemon 未装配 |
 | `soul-daemon` | **已实现生命周期装配（SH-007A）**：配置、日志、数据目录、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机。进入 `RUNNING` 只表示进程持有数据库，**不是**人格认知循环已运行 |
-| Persona / Runtime 恢复、Event Bus、Scheduler | **未实现**。Daemon 源码把这些步骤标为 `not_implemented`（owner 记为 SH-008，进行中；这些步骤属 SH-008B–E） |
+| Persona / Runtime 恢复、Event Bus、Scheduler | **未实现**。Daemon 源码把这些步骤标为 `not_implemented`（owner 记为 SH-008，进行中；Daemon 接线属 SH-008C–E。SH-008B 只提供进程内状态机，尚未被 Daemon 调用） |
 | HTTP / WebSocket / 健康检查 | **未实现**（源码 owner 记为 SH-009；该任务未开始） |
 | 记忆图 / 激活 / 睡眠 / 梦境 / 执行网关 | **未实现** |
 | Studio / CLI | **未实现**（目录不存在） |

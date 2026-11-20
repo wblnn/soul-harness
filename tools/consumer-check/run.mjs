@@ -111,7 +111,7 @@ try {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-// --- runtime: the built entry allocates ids and does not pretend to run ------
+// --- runtime: allocator plus in-process persona lifecycle, nothing later -----
 
 for (const absent of [
   'createRuntime',
@@ -120,8 +120,11 @@ for (const absent of [
   'recover',
   'checkpointAll',
 ]) {
-  assert.equal(absent in runtime, false, `${absent} must not be exported by SH-008A`);
+  assert.equal(absent in runtime, false, `${absent} must not be exported yet`);
 }
+
+assert.equal(typeof runtime.createPersonaLifecycle, 'function');
+assert.equal(runtime.PERSONA_DISPLAY_NAME_MAX_LENGTH, 128);
 
 const allocated = runtime.allocatePersonaId();
 assert.equal(typeof allocated, 'string');
@@ -166,6 +169,47 @@ assert.throws(
   (error) => runtime.isRuntimeError(error) && error.code === 'id_collision',
 );
 
+const runtimeDir = mkdtempSync(join(tmpdir(), 'sh-consumer-runtime-'));
+try {
+  const runtimeStore = persistence.openStore({ file: join(runtimeDir, 'soul.db') });
+  persistence.migrate(runtimeStore);
+  const noop = { debug() {}, info() {}, warn() {}, error() {} };
+  const life = runtime.createPersonaLifecycle({
+    store: runtimeStore,
+    logger: noop,
+    bootId: 'consumer-boot',
+  });
+  const created = await life.createPersona({ displayName: 'Consumer' });
+  assert.equal(isPersonaId(created.id), true);
+  assert.equal(created.state, 'CREATED');
+  assert.equal(created.epoch, 1);
+  assert.equal(created.version, 0);
+  const started = await life.startPersona(created.id);
+  assert.equal(started.state, 'RUNNING');
+  assert.equal(started.version, 2);
+  assert.equal(started.bootId, 'consumer-boot');
+  assert.equal(started.epoch, 1);
+  assert.equal(started.runtimeState.epoch, 1);
+  const suspended = await life.suspendPersona(created.id);
+  assert.equal(suspended.state, 'SUSPENDED');
+  const resumed = await life.resumePersona(created.id);
+  assert.equal(resumed.state, 'RUNNING');
+  const stopped = await life.stopPersona(created.id);
+  assert.equal(stopped.state, 'STOPPED');
+  assert.equal(stopped.version, 6);
+  const restored = life.restorePersona(created.id);
+  assert.equal(restored.id, created.id);
+  assert.equal(life.listPersonas().length, 1);
+  await life.startPersona(created.id);
+  await assert.rejects(
+    life.startPersona(created.id),
+    (error) => runtime.isRuntimeError(error) && error.code === 'illegal_transition',
+  );
+  runtimeStore.close();
+} finally {
+  rmSync(runtimeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
+
 console.log(
-  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime allocator ok`,
+  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime persona lifecycle ok`,
 );

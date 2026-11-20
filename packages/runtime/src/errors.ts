@@ -13,6 +13,9 @@ export const RUNTIME_ERROR_CODES = [
   'invalid_entropy',
   'id_collision',
   'id_encoding',
+  'not_found',
+  'illegal_transition',
+  'version_conflict',
 ] as const;
 
 export type RuntimeErrorCode = (typeof RUNTIME_ERROR_CODES)[number];
