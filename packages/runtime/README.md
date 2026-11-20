@@ -78,7 +78,7 @@
 | 去重 | 键是 `(personaId, adapterId, source, adapterEventRef)`，在同一次 `withRead` 里和人格行一起读。命中则返回既有 `eventId` 与 `status`，`bodyVerified` 恒为 `false`，指标 `dedupe.body_unverifiable` +1。不读正文、不写正文、不调用 `archive.compare`。`expired` / `rejected` 保持终态 |
 | 会话 | 有 `externalSessionRef` 时，复用 `(personaId, adapterId, externalSessionRef)` 上仍开着的 `sessionId`。已关闭的不复活，另分配新 id。没有这个字段则 `sessionId` 为 null |
 | 落库 | 未命中时分配 `eventId`（占用则重试；唯一约束冲突再读去重键，命中则按上面的幂等返回）。短事务里先写 `received`，同一提交进入 `accepted`（`archive_state='none'`、`disposition` 与 `archive_ref` 皆 NULL）。缓冲已满则同一提交进入 `expired` + `queue_overflow`，结果是 `refused` |
-| ACK | 事务提交之后才返回，而且返回值跟库里的行一致。若提交前 TTL 已经过了，正文不进缓冲，行收成 `expired` + `ttl_expired`，结果是 `outcome: 'expired'`。定时器登记失败同样不留正文，并尽量把行收成 `expired` + `buffer_lost`（缓冲没能留下，不是时间到期）。这次收口若写库失败，行仍是 `accepted`，事件 id 进入不含正文的重试名单，返回值也仍是 `accepted` |
+| ACK | 事务提交之后才返回，而且返回值跟库里的行一致。提交之后的时钟或登记异常不会把这次调用变成 rejected Promise。若提交前 TTL 已经过了，正文不进缓冲，行收成 `expired` + `ttl_expired`，结果是 `outcome: 'expired'`。定时器登记或重注册失败同样不留正文，并收成 `rejected` + `processing_failed`。`buffer_lost` 仍只属于崩溃恢复，本批不用。收口写库或时钟失败时，行保持库里的 `accepted`，事件 id 进入不含正文的重试名单，返回值也是 `accepted` |
 | TTL | `readBuffered` 自己看时钟。`expiresAt <= now` 时先从内存删掉正文并返回 `null`，然后再尝试把活跃行收成 `ttl_expired`。数据库写失败不会把正文放回去；失败记 `ingress.ttl_persist_failed`，事件 id 留在不含正文的重试名单里，之后的 `evictExpired` 或同人格的下一次受理会再写元数据。已经是终态的行不改。`close()` 取消定时器并丢掉缓冲 |
 
 `accepted` 只表示信封已经落库。`audited` 恒为 `false`。本批不会把事件推进到 `noticed` / `understood` / `response_committed` / `acted`。
@@ -127,11 +127,11 @@ packages/runtime/
 │  ├─ ids/{encode,allocate}.ts      # 冻结编码与分配
 │  ├─ persona/{lifecycle,queue}.ts  # 状态机与人格级写队列
 │  └─ events/{schema,buffer,bus}.ts # P1 校验、TTL 缓冲、进程内 Ingress
-└─ test/                            # 83 项
+└─ test/                            # 85 项
    ├─ allocator.test.ts             # 29 项。向量、时钟、碰撞、SQLite 主键
    ├─ allocator-sample.test.ts      # 2 项。OPEN-7 大样本
    ├─ persona-lifecycle.test.ts     # 21 项。真实 SQLite 上的生命周期
-   └─ ingress.test.ts               # 31 项。真实 SQLite 上的 P1 Ingress
+   └─ ingress.test.ts               # 33 项。真实 SQLite 上的 P1 Ingress
 ```
 
 ## 5. 依赖
@@ -193,7 +193,7 @@ close(): void
 metrics(): { 'dedupe.body_unverifiable': number }
 ```
 
-`IngressResult` 是 `accepted`（`audited: false`）、`duplicate`（`bodyVerified: false`，状态可以是终态）、`expired`（提交后、ACK 前已经收成 `ttl_expired` 或 `buffer_lost`）、`refused`（缓冲已满，已落成 `expired` + `queue_overflow`）或 `backpressure`（在途受理已满，未入队、未落库）。没有 HTTP 状态码。
+`IngressResult` 是 `accepted`（`audited: false`）、`duplicate`（`bodyVerified: false`，状态可以是终态）、`expired`（提交后、ACK 前已经收成 `ttl_expired`）、`rejected`（缓冲没能留下，收成 `processing_failed`）、`refused`（缓冲已满，已落成 `expired` + `queue_overflow`）或 `backpressure`（在途受理已满，未入队、未落库）。没有 HTTP 状态码。`buffer_lost` 的定义仍以 DATA-MODEL 为准，只用于崩溃或重启后的恢复扫描。
 
 错误码：`invalid_argument` / `invalid_clock` / `invalid_entropy` / `id_collision` / `id_encoding` / `not_found` / `illegal_transition` / `version_conflict` / `schema_invalid` / `closed`。消息不回显时钟、熵、候选 ID、display name 或刺激正文。存储层的 `store_closed` 等错误原样抛出，不包装成 RuntimeError（创建人格时的唯一约束除外，包装成 `id_collision`；Ingress 在去重键冲突时改走幂等返回）。
 
@@ -204,7 +204,7 @@ metrics(): { 'dedupe.body_unverifiable': number }
 | `test/allocator.test.ts` | 29 项。已知向量、前缀不可混用、时钟进退、碰撞重试、真实 SQLite 主键冲突不覆盖、`src/` 无 SQL / 无环境读取，且只依赖 contracts 与 persistence |
 | `test/allocator-sample.test.ts` | 2 项。每个前缀 10000 个 ID，另加同毫秒突发 10000 个；全部通过 contracts 的 `is*` / `parse*`，样本内唯一 |
 | `test/persona-lifecycle.test.ts` | 21 项。真实迁移后的 SQLite：合法与非法转移、任意状态 stop、按 boot 区分的崩溃归一、按 ID 恢复且不新建、多人格隔离、同人格并发、过期 version 不覆盖、epoch 不变、检查点不被生命周期写掉、分页列表、日志失败不掩盖提交、双连接读快照、非法参数拒绝 Promise |
-| `test/ingress.test.ts` | 31 项。真实 SQLite：信封正反例与注入时钟、去重不插第二行且不声称正文一致、终态不重开、唯一约束冲突后的幂等收敛、会话复用与关闭后新建、金丝雀正文只活在 TTL 缓冲里、source 与人格两级在途上限、入队前背压、过期正文不可读、受理期间 TTL 到期时返回值与库一致、TTL 元数据失败后的重试且时钟抛错不产生未处理 rejection、定时器登记失败收成 `buffer_lost`、快照不被事后篡改、`receivedAt` 取入口时间、人格与 source 隔离、同人格串行、日志失败不掩盖结果、非法配置与非法参数拒绝 Promise |
+| `test/ingress.test.ts` | 33 项。真实 SQLite：信封正反例与注入时钟、去重不插第二行且不声称正文一致、终态不重开、唯一约束冲突后的幂等收敛、会话复用与关闭后新建、金丝雀正文只活在 TTL 缓冲里、source 与人格两级在途上限、入队前背压、过期正文不可读、受理期间 TTL 到期时返回值与库一致、提交后时钟抛错仍返回已提交状态并进入无正文收口队列、TTL 元数据失败后的重试且时钟抛错不产生未处理 rejection、定时器登记失败与提前触发后重注册失败都收成 `processing_failed`、快照不被事后篡改、`receivedAt` 取入口时间、人格与 source 隔离、同人格串行、日志失败不掩盖结果、非法配置与非法参数拒绝 Promise |
 
 OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」写成验收。
 
@@ -220,5 +220,6 @@ OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」
 6. 已经 `STOPPED` 的 `stop` 不会顺便修理一张和人格行不一致的 `runtime_state`。正常路径的写入是一起提交的。
 7. 没有任务调度、扫描 A/B、检查点编排，也没有 HTTP。P1 的 `accepted` 不是审计，也不是已经理解。进程重启后内存缓冲不在；把因此丢失的活跃事件收成 `buffer_lost` 属于 SH-008E。
 8. 在途上限和正文缓冲都记在本 Ingress 实例的内存里。两个 Ingress 共用一个库时，容量不会加总；生产部署是一个 Daemon、一个 Ingress。入队前的 `backpressure` 不会写成事件行。`personaAdmissionCapacity` 管的是在途受理，不管已经落库的正文份数。
-9. 正文过期或缓冲登记失败都不依赖「先把库写成功」。元数据写失败时，正文已经不可读；只把 `eventId` 和原因码留在重试名单里，自动定时重试最多 3 次，之后靠 `evictExpired` 或同人格的下一次受理补写。重试回调里的异常会被接住，不会变成未处理的 rejection。`close()` 会再试一次然后丢掉这份名单。进程退出后仍是 `accepted` 的行，要等 SH-008E 按缓冲丢失收口。`buffer_lost` 在这里表示缓冲没能留下，不是崩溃扫描那条路径。
+9. 正文过期或缓冲登记失败都不依赖「先把库写成功」。元数据写失败时，正文已经不可读；只把 `eventId` 和原因码留在重试名单里，自动定时重试最多 3 次，之后靠 `evictExpired` 或同人格的下一次受理补写。重试回调里的异常会被接住，不会变成未处理的 rejection。提交已经成功之后，时钟再抛错也不会把这次调用变成失败。`close()` 会再试一次然后丢掉这份名单。进程退出后仍是 `accepted` 的行，要等 SH-008E 按 `buffer_lost` 收口。本批运行期不用 `buffer_lost`；缓冲没能留下时用 `rejected` + `processing_failed`。
 10. `externalSessionRef` 会进 `sessions.external_id`。金丝雀测试覆盖的是刺激正文，不是这个适配器会话键。
+11. 跨多个 source 的已受理缓冲总条数、总字节数和单条载荷上限留到 SH-010 做插件接入安全验收。本批不引入插件注册表。

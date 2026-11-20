@@ -1190,11 +1190,11 @@ describe('ingress — admission bounds and snapshot', () => {
       },
     });
     expect(accepted).toMatchObject({
-      outcome: 'expired',
-      status: 'expired',
-      reason: 'buffer_lost',
+      outcome: 'rejected',
+      status: 'rejected',
+      reason: 'processing_failed',
     });
-    if (accepted.outcome !== 'expired') {
+    if (accepted.outcome !== 'rejected') {
       throw new Error('expected the lost buffer to be closed before ACK');
     }
     expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
@@ -1202,8 +1202,8 @@ describe('ingress — admission bounds and snapshot', () => {
     expect(JSON.stringify(fixture.logs)).toContain('ingress.buffer_failed');
     expect(dump(fixture.store)).not.toContain(CANARY);
     expect(createRepositories(fixture.store).events.getById(accepted.eventId)).toMatchObject({
-      status: 'expired',
-      statusReason: 'buffer_lost',
+      status: 'rejected',
+      statusReason: 'processing_failed',
     });
   });
 
@@ -1436,6 +1436,107 @@ describe('ingress — review bounds', () => {
       expect(createRepositories(fixture.store).events.getById(accepted.eventId)).toMatchObject({
         status: 'expired',
         statusReason: 'ttl_expired',
+      });
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+});
+
+describe('ingress — post-commit isolation', () => {
+  it('returns the committed row when the clock fails after the envelope is stored', async () => {
+    const fixture = openFixture();
+    const id = persona(43);
+    seedPersona(fixture.store, id);
+    fixture.time = 4_000;
+    let trap = false;
+    const bus = ingress(fixture, {
+      config: { queueCapacity: 2, bufferTtlMs: 60_000 },
+      now: () => {
+        if (trap) {
+          trap = false;
+          throw new Error('clock-after-commit');
+        }
+        return fixture.time;
+      },
+      beforePersist: () => {
+        trap = true;
+      },
+    });
+    const result = await bus.acceptStimulus({
+      stimulus: {
+        ...(envelope(id, 'mc-clock').stimulus as object),
+        payload: { kind: 'mc.world', version: 1, text: CANARY },
+      },
+    });
+
+    expect(result).toMatchObject({ outcome: 'accepted', status: 'accepted', receivedAt: 4_000 });
+    if (result.outcome !== 'accepted') {
+      throw new Error('expected the committed accept to be returned');
+    }
+    expect(bus.readBuffered(id, result.eventId)).toBeNull();
+    expect(dump(fixture.store)).not.toContain(CANARY);
+    expect(createRepositories(fixture.store).events.getById(result.eventId)).toMatchObject({
+      status: 'accepted',
+      statusReason: null,
+    });
+    expect(JSON.stringify(fixture.logs)).toContain('ingress.post_commit_failed');
+
+    const repaired = await bus.evictExpired();
+    expect(repaired).toEqual([]);
+    expect(createRepositories(fixture.store).events.getById(result.eventId)).toMatchObject({
+      status: 'rejected',
+      statusReason: 'processing_failed',
+    });
+  });
+
+  it('drops the body when a later timer registration throws and closes the event', async () => {
+    const fixture = openFixture();
+    const id = persona(44);
+    seedPersona(fixture.store, id);
+    fixture.time = 1_000;
+    let schedules = 0;
+    const timers: { delay: number; fire: () => void }[] = [];
+    const rejections: unknown[] = [];
+    const onRejection = (error: unknown): void => {
+      rejections.push(error);
+    };
+    process.on('unhandledRejection', onRejection);
+    try {
+      const bus = ingress(fixture, {
+        config: { queueCapacity: 2, bufferTtlMs: 60_000 },
+        timers: {
+          schedule(delayMs, fire) {
+            schedules += 1;
+            if (schedules > 1) {
+              throw new Error('rearm-failed');
+            }
+            timers.push({ delay: delayMs, fire });
+            return { cancel() {} };
+          },
+        },
+      });
+      const accepted = await bus.acceptStimulus({
+        stimulus: {
+          ...(envelope(id, 'mc-rearm').stimulus as object),
+          payload: { kind: 'mc.world', version: 1, text: CANARY },
+        },
+      });
+      if (accepted.outcome !== 'accepted') {
+        throw new Error('expected accepted');
+      }
+      expect(bus.readBuffered(id, accepted.eventId)?.payload).toMatchObject({ text: CANARY });
+      expect(() => timers[0]?.fire()).not.toThrow();
+      await waitFor(
+        () =>
+          createRepositories(fixture.store).events.getById(accepted.eventId)?.status === 'rejected',
+      );
+      expect(rejections).toEqual([]);
+      expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+      expect(dump(fixture.store)).not.toContain(CANARY);
+      expect(createRepositories(fixture.store).events.getById(accepted.eventId)).toMatchObject({
+        status: 'rejected',
+        statusReason: 'processing_failed',
       });
     } finally {
       process.off('unhandledRejection', onRejection);

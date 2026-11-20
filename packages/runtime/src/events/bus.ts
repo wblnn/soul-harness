@@ -68,8 +68,11 @@ export interface IngressChannelLimits {
   readonly bufferTtlMs: number;
 }
 
-/** Why a committed envelope was closed before its body could stay readable. */
-export type BufferCloseReason = 'ttl_expired' | 'buffer_lost';
+/**
+ * Metadata close for a body that is already gone.
+ * `buffer_lost` is not used here: DATA-MODEL reserves it for crash recovery.
+ */
+export type BufferCloseReason = 'ttl_expired' | 'processing_failed';
 
 /**
  * Required limits. Missing or illegal values throw at construction.
@@ -182,14 +185,30 @@ export interface IngressExpired {
   readonly outcome: 'expired';
   readonly eventId: EventId;
   readonly status: 'expired';
-  readonly reason: BufferCloseReason;
+  readonly reason: 'ttl_expired';
+  readonly sessionId: SessionId | null;
+  readonly receivedAt: number;
+  readonly occurredAt: number | null;
+}
+
+/** Runtime close when the body could not be kept. Not a crash-recovery `buffer_lost`. */
+export interface IngressRejected {
+  readonly outcome: 'rejected';
+  readonly eventId: EventId;
+  readonly status: 'rejected';
+  readonly reason: 'processing_failed';
   readonly sessionId: SessionId | null;
   readonly receivedAt: number;
   readonly occurredAt: number | null;
 }
 
 export type IngressResult =
-  IngressAccepted | IngressDuplicate | IngressRefused | IngressBackpressure | IngressExpired;
+  | IngressAccepted
+  | IngressDuplicate
+  | IngressRefused
+  | IngressBackpressure
+  | IngressExpired
+  | IngressRejected;
 
 export interface AcceptStimulusInput {
   /** Closed `soul.stimulus.input.v1` document. `receivedAt` is rejected. */
@@ -404,24 +423,36 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     const key = ttlKey(personaId, eventId);
     try {
       options.beforeExpire?.();
-      const row = repos.events.expireActive({
-        id: eventId,
-        personaId,
-        updatedAt: now,
-        reason,
-      });
+      const row =
+        reason === 'ttl_expired'
+          ? repos.events.expireActive({
+              id: eventId,
+              personaId,
+              updatedAt: now,
+              reason: 'ttl_expired',
+            })
+          : repos.events.rejectIfActive({
+              id: eventId,
+              personaId,
+              updatedAt: now,
+              reason: 'processing_failed',
+            });
       pendingTtl.delete(key);
       if (row === null) {
         return null;
       }
-      safeLog('info', reason === 'ttl_expired' ? 'ingress.ttl_expired' : 'ingress.buffer_lost', {
-        eventId: row.id,
-        personaId: row.personaId,
-        adapterId: row.adapterId,
-        source: row.source,
-        status: row.status,
-        reason,
-      });
+      safeLog(
+        'info',
+        reason === 'ttl_expired' ? 'ingress.ttl_expired' : 'ingress.processing_failed',
+        {
+          eventId: row.id,
+          personaId: row.personaId,
+          adapterId: row.adapterId,
+          source: row.source,
+          status: row.status,
+          reason,
+        },
+      );
       return row;
     } catch {
       const attempts = (pendingTtl.get(key)?.attempts ?? 0) + 1;
@@ -447,21 +478,49 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
   }
 
   function expiredResult(row: EventRow): IngressExpired | null {
-    if (
-      row.status !== 'expired' ||
-      (row.statusReason !== 'ttl_expired' && row.statusReason !== 'buffer_lost')
-    ) {
+    if (row.status !== 'expired' || row.statusReason !== 'ttl_expired') {
       return null;
     }
     return {
       outcome: 'expired',
       eventId: row.id,
       status: 'expired',
-      reason: row.statusReason,
+      reason: 'ttl_expired',
       sessionId: row.sessionId,
       receivedAt: row.receivedAt,
       occurredAt: row.occurredAt,
     };
+  }
+
+  function rejectedResult(row: EventRow): IngressRejected | null {
+    if (row.status !== 'rejected' || row.statusReason !== 'processing_failed') {
+      return null;
+    }
+    return {
+      outcome: 'rejected',
+      eventId: row.id,
+      status: 'rejected',
+      reason: 'processing_failed',
+      sessionId: row.sessionId,
+      receivedAt: row.receivedAt,
+      occurredAt: row.occurredAt,
+    };
+  }
+
+  function closedResult(row: EventRow | null): IngressExpired | IngressRejected | null {
+    if (row === null) {
+      return null;
+    }
+    return expiredResult(row) ?? rejectedResult(row);
+  }
+
+  function notePending(personaId: PersonaId, eventId: EventId, reason: BufferCloseReason): void {
+    const key = ttlKey(personaId, eventId);
+    if (pendingTtl.has(key) || closed) {
+      return;
+    }
+    pendingTtl.set(key, { eventId, personaId, reason, attempts: 1 });
+    scheduleMetadataRetry(personaId, eventId, reason);
   }
 
   function flushPending(personaId: PersonaId): TtlClose[] {
@@ -490,7 +549,17 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     }
     const now = readClock();
     if (current.expiresAt > now) {
-      buffer.rearm(current.personaId, current.eventId);
+      try {
+        buffer.rearm(current.personaId, current.eventId);
+      } catch {
+        buffer.take(current.personaId, current.eventId);
+        safeLog('error', 'ingress.buffer_rearm_failed', {
+          eventId: current.eventId,
+          personaId: current.personaId,
+          reason: 'processing_failed',
+        });
+        persistExpire(current.personaId, current.eventId, now, 'processing_failed');
+      }
       return null;
     }
     // The body is unreadable before the database is asked to agree.
@@ -656,6 +725,40 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     });
   }
 
+  function onUnarmed(slot: BufferSlot): void {
+    void queue
+      .run(slot.personaId, () => {
+        buffer.take(slot.personaId, slot.eventId);
+        let now: number;
+        try {
+          now = readClock();
+        } catch {
+          notePending(slot.personaId, slot.eventId, 'processing_failed');
+          safeLog('error', 'ingress.buffer_rearm_failed', {
+            eventId: slot.eventId,
+            personaId: slot.personaId,
+            reason: 'processing_failed',
+          });
+          return null;
+        }
+        safeLog('error', 'ingress.buffer_rearm_failed', {
+          eventId: slot.eventId,
+          personaId: slot.personaId,
+          reason: 'processing_failed',
+        });
+        persistExpire(slot.personaId, slot.eventId, now, 'processing_failed');
+        return null;
+      })
+      .catch(() => {
+        notePending(slot.personaId, slot.eventId, 'processing_failed');
+        safeLog('error', 'ingress.buffer_rearm_failed', {
+          eventId: slot.eventId,
+          personaId: slot.personaId,
+          reason: 'processing_failed',
+        });
+      });
+  }
+
   function remember(row: EventRow, stimulus: StimulusV1, expiresAt: number): void {
     buffer.put(
       {
@@ -668,6 +771,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
         payload: stimulus.payload,
       },
       onDue,
+      onUnarmed,
     );
   }
 
@@ -754,40 +858,55 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       return duplicateOf(written.row);
     }
     if (outcome === 'accepted' && !closed) {
-      if (expiresAt <= readClock()) {
-        // Receipt-time TTL already elapsed while this task waited. Do not publish the body.
-        const expired = persistExpire(
-          written.row.personaId,
-          written.row.id,
-          readClock(),
-          'ttl_expired',
-        );
-        const reported = expired === null ? null : expiredResult(expired);
-        if (reported !== null) {
-          return reported;
-        }
-      } else {
-        try {
-          remember(written.row, stimulus, expiresAt);
-        } catch {
-          safeLog('error', 'ingress.buffer_failed', {
-            eventId: written.row.id,
-            personaId: written.row.personaId,
-          });
-          const expired = persistExpire(
-            written.row.personaId,
-            written.row.id,
-            readClock(),
-            'buffer_lost',
-          );
-          const reported = expired === null ? null : expiredResult(expired);
-          if (reported !== null) {
-            return reported;
-          }
-        }
+      try {
+        return settleAccepted(written.row, stimulus, expiresAt);
+      } catch {
+        // The envelope is already committed. A later clock or diagnostic
+        // failure must not turn that into a rejected promise.
+        buffer.take(written.row.personaId, written.row.id);
+        safeLog('error', 'ingress.post_commit_failed', {
+          eventId: written.row.id,
+          personaId: written.row.personaId,
+          reason: 'processing_failed',
+        });
+        notePending(written.row.personaId, written.row.id, 'processing_failed');
+        return finishCreated(written.row, 'accepted');
       }
     }
     return finishCreated(written.row, outcome);
+  }
+
+  function settleAccepted(row: EventRow, stimulus: StimulusV1, expiresAt: number): IngressResult {
+    const now = readClock();
+    if (expiresAt <= now) {
+      const expired = persistExpire(row.personaId, row.id, now, 'ttl_expired');
+      const reported = closedResult(expired);
+      if (reported !== null) {
+        return reported;
+      }
+      return finishCreated(row, 'accepted');
+    }
+    try {
+      remember(row, stimulus, expiresAt);
+    } catch {
+      safeLog('error', 'ingress.buffer_failed', {
+        eventId: row.id,
+        personaId: row.personaId,
+      });
+      let stamp: number;
+      try {
+        stamp = readClock();
+      } catch {
+        notePending(row.personaId, row.id, 'processing_failed');
+        return finishCreated(row, 'accepted');
+      }
+      const rejected = persistExpire(row.personaId, row.id, stamp, 'processing_failed');
+      const reported = closedResult(rejected);
+      if (reported !== null) {
+        return reported;
+      }
+    }
+    return finishCreated(row, 'accepted');
   }
 
   return {

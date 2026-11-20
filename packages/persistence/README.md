@@ -47,7 +47,7 @@ packages/persistence/
 │  ├─ migrations/{types,expected-schema,load,migrator}.ts
 │  ├─ repositories/{personas,sessions,events,tasks,runtime-state,checkpoint,schema-migrations,shared,index}.ts
 │  └─ types/rows.ts                # camelCase 行类型（复用 contracts 品牌 ID）
-└─ test/                           # 307 项，真实 SQLite 文件
+└─ test/                           # 311 项，真实 SQLite 文件
 ```
 
 ## 4. 依赖
@@ -118,7 +118,7 @@ withRead(store, (tx) => T): T
 |---|---|
 | `personas` | `insert` / `insertWithRuntimeState` / `getById` / `updateState`（版本自增）/ `compareAndSetState`（条件写）/ `commitLifecycle`（条件写并镜像 `runtime_state`）/ `list(limit)` / `listPage`（键集分页） |
 | `sessions` | `insert` / `getById` / `findActiveByExternal` / `openActive`（只返回未关闭映射，关闭后插入新 id）/ `close` / `listByPersona` |
-| `events` | `insert`（archive 三列不可设；`summary` 只接受 NULL；`adapterEventRef` 强制格式）/ `getById` / `findByDedupeKey` / `updateStatus` / `expireIfActive`（条件写：必须带 `personaId`，且仅 P1 `archive_state='none'`）/ `commitP1Envelope`（同一事务 `received` → P1 结局）/ `expireActive`（同一守卫，原因码由调用方指定）/ `listByPersonaStatus` / `listPageByPersonaStatus`（键集分页） |
+| `events` | `insert`（archive 三列不可设；`summary` 只接受 NULL；`adapterEventRef` 强制格式）/ `getById` / `findByDedupeKey` / `updateStatus` / `expireIfActive`（条件写：必须带 `personaId`，且仅 P1 `archive_state='none'`，只写 `buffer_lost`）/ `commitP1Envelope`（同一事务 `received` → P1 结局）/ `expireActive`（同一守卫，只接受过期原因码）/ `rejectIfActive`（同一守卫，只接受拒绝原因码）/ `listByPersonaStatus` / `listPageByPersonaStatus`（键集分页） |
 | `tasks` | `insert` / `getById` / `updateState` / `listByPersonaState` |
 | `runtime_state` | `upsert`（不触碰 checkpoint）/ `get` |
 | `checkpoints` | `load` / `save`（见 §7.1；**无 clear**） |
@@ -237,8 +237,9 @@ Ingress 需要两件现有方法做不到的事：在一个写事务里区分「
 | `sessions.openActive({ id, personaId, adapterId, externalId, openedAt })` | 已有 `closed_at IS NULL` 的同键行则返回它（`created: false`），不使用调用方这次带来的 `id`。没有则插入 `id`（`created: true`）。已关闭的行不会被打开。唯一冲突若能再读到活跃行，返回那一行；主键被别的外部引用占用则抛 `unique_conflict`，调用方另分配 id |
 | `events.commitP1Envelope(input)` | 同一 `withWrite` 内先插入 `status='received'`（归档列不出现在语句里，保持 NULL / NULL / `'none'`），再更新为 `accepted`，或 `expired` + `queue_overflow`。提交后看不到中间的 `received`。不接收正文。去重键或主键冲突 → `unique_conflict`，事务回滚 |
 | `events.expireActive({ id, personaId, updatedAt, reason })` | 与 `expireIfActive` 同一条守卫：`persona_id` + `id` + `status IN ('received','accepted')` + `archive_state='none'`。`reason` 只能是过期原因码。未命中返回 `null`，终态和非 `none` 的归档状态都不改 |
+| `events.rejectIfActive({ id, personaId, updatedAt, reason })` | 同一条守卫，但写成 `rejected`。`reason` 只能是拒绝原因码。不写 `buffer_lost`。未命中返回 `null` |
 
-`expireIfActive` 仍只写 `buffer_lost`，语义与 SH-008P / PR #3 相同，没有改成通用方法。`openActive` 的 `externalId` 必须是去掉首尾空白、不含空白或控制字符、长度 1..256 的字符串（`ACTIVE_SESSION_EXTERNAL_ID_MAX_LENGTH`）。这是写入边界，不是协议里的新字符集；超限在开事务前拒绝。原有 `sessions.insert` 不套用这条长度限制。
+`expireIfActive` 仍只写 `buffer_lost`，语义与 SH-008P / PR #3 相同，没有改成通用方法。运行期把活跃事件收成 `rejected` 走 `rejectIfActive`，不借用 `buffer_lost`。`openActive` 的 `externalId` 必须是去掉首尾空白、不含空白或控制字符、长度 1..256 的字符串（`ACTIVE_SESSION_EXTERNAL_ID_MAX_LENGTH`）。这是写入边界，不是协议里的新字符集；超限在开事务前拒绝。原有 `sessions.insert` 不套用这条长度限制。
 
 `commitP1Envelope` 的 `outcome` 只允许 `accepted`，或 `expired` 且原因为 `queue_overflow`。其它形状在开事务前 → `invalid_argument`。
 

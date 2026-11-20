@@ -24,6 +24,7 @@ import {
   isEventId,
   isExpiredReason,
   isPersonaId,
+  isRejectedReason,
   isSessionId,
   isSourceId,
 } from '@soul-harness/contracts';
@@ -34,6 +35,7 @@ import type {
   EventStatus,
   ExpiredReason,
   PersonaId,
+  RejectedReason,
   SessionId,
   SourceId,
   StatusReason,
@@ -177,6 +179,19 @@ export interface ExpireActiveEventInput {
 }
 
 /**
+ * Conditional close of a still-active P1 event to `rejected`.
+ *
+ * Same row guard as `expireActive`. `reason` is a rejection code, not an
+ * expiry code. `buffer_lost` stays on `expireIfActive` and is not accepted here.
+ */
+export interface RejectActiveEventInput {
+  readonly id: EventId;
+  readonly personaId: PersonaId;
+  readonly updatedAt: number;
+  readonly reason: RejectedReason;
+}
+
+/**
  * Rejects a scope that cannot be a persona id before any database access.
  *
  * Identifier shape uses `invalid_identifier` (same code as `adapterEventRef`).
@@ -259,6 +274,21 @@ function assertExpireActiveInput(input: ExpireActiveEventInput): void {
   assertTimestamp(input.updatedAt, 'updatedAt');
   if (!isExpiredReason(input.reason)) {
     throw new PersistenceError('invalid_argument', 'reason must be an expired status reason', {
+      details: { field: 'reason' },
+    });
+  }
+}
+
+function assertRejectActiveInput(input: RejectActiveEventInput): void {
+  if (!isEventId(input.id)) {
+    throw new PersistenceError('invalid_identifier', 'event id must be a valid EventId', {
+      details: { field: 'id' },
+    });
+  }
+  assertPersonaId(input.personaId);
+  assertTimestamp(input.updatedAt, 'updatedAt');
+  if (!isRejectedReason(input.reason)) {
+    throw new PersistenceError('invalid_argument', 'reason must be a rejected status reason', {
       details: { field: 'reason' },
     });
   }
@@ -555,6 +585,30 @@ export function createEventRepository(store: Store) {
           .prepare(
             `UPDATE events
                 SET status = 'expired', status_reason = ?, updated_at = ?
+              WHERE persona_id = ? AND id = ? AND status IN ('received', 'accepted')
+                AND archive_state = 'none'`,
+          )
+          .run(input.reason, input.updatedAt, input.personaId, input.id).changes;
+
+        return Number(changes) === 0 ? null : selectById(tx, input.id);
+      });
+    },
+
+    /**
+     * Moves a still-active P1 event to `rejected` with a controlled reason.
+     *
+     * Same guard as `expireActive`: persona scope, `received` or `accepted`,
+     * and `archive_state = 'none'`. It does not write `buffer_lost`. A miss
+     * returns null. `attention_outcome` stays as it was.
+     */
+    rejectIfActive(input: RejectActiveEventInput): EventRow | null {
+      assertRejectActiveInput(input);
+
+      return withWrite(store, (tx) => {
+        const changes = tx
+          .prepare(
+            `UPDATE events
+                SET status = 'rejected', status_reason = ?, updated_at = ?
               WHERE persona_id = ? AND id = ? AND status IN ('received', 'accepted')
                 AND archive_state = 'none'`,
           )

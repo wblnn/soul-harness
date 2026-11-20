@@ -65,6 +65,7 @@ export type {
   IngressMetrics,
   IngressPersistView,
   IngressRefused,
+  IngressRejected,
   IngressResult,
   QueuedStimulus,
   StimulusIngress,

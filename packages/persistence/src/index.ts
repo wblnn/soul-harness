@@ -81,6 +81,7 @@ export type {
   EventRepository,
   ExpireActiveEventInput,
   InsertEventInput,
+  RejectActiveEventInput,
   InsertPersonaInput,
   InsertSessionInput,
   InsertTaskInput,

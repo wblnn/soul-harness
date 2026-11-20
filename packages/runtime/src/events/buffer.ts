@@ -50,7 +50,11 @@ export interface BufferSlot {
 }
 
 export interface PerceptionBuffer {
-  put(slot: BufferSlot, onDue: (slot: BufferSlot) => void): void;
+  put(
+    slot: BufferSlot,
+    onDue: (slot: BufferSlot) => void,
+    onUnarmed: (slot: BufferSlot) => void,
+  ): void;
   peek(personaId: PersonaId, eventId: EventId): BufferSlot | null;
   /** Occupied slots for one persona and one source, including ones already due. */
   count(personaId: PersonaId, source: SourceId): number;
@@ -66,6 +70,7 @@ export interface PerceptionBuffer {
 interface Held {
   readonly slot: BufferSlot;
   onDue: (slot: BufferSlot) => void;
+  onUnarmed: (slot: BufferSlot) => void;
   timer: IngressTimer | null;
 }
 
@@ -95,39 +100,55 @@ export function createPerceptionBuffer(options: {
     }
   }
 
+  function dropHeld(held: Held): void {
+    const slots = byPersona.get(held.slot.personaId);
+    if (slots?.get(held.slot.eventId) !== held) {
+      return;
+    }
+    held.timer?.cancel();
+    held.timer = null;
+    slots.delete(held.slot.eventId);
+    forgetPersonaIfEmpty(held.slot.personaId, slots);
+  }
+
   function arm(held: Held): void {
     held.timer?.cancel();
     held.timer = null;
     const remaining = held.slot.expiresAt - options.now();
     const delay = remaining <= 0 ? 0 : Math.min(remaining, MAX_TIMER_DELAY_MS);
     const timer = options.scheduler.schedule(delay, () => {
-      const current = lookup(held.slot.personaId, held.slot.eventId);
-      if (current !== held) {
-        return;
-      }
-      held.timer = null;
-      let due: boolean;
       try {
-        due = held.slot.expiresAt <= options.now();
+        const current = lookup(held.slot.personaId, held.slot.eventId);
+        if (current !== held) {
+          return;
+        }
+        held.timer = null;
+        const due = held.slot.expiresAt <= options.now();
+        if (due) {
+          held.onDue(held.slot);
+          return;
+        }
+        arm(held);
       } catch {
-        // The clock failed. Leave the body in place; the next sweep can retry.
-        return;
+        // A failed re-arm or a clock read must not escape the timer callback,
+        // and must not leave a body with no timer.
+        dropHeld(held);
+        try {
+          held.onUnarmed(held.slot);
+        } catch {
+          // The owner is responsible for its own logging. The callback stops here.
+        }
       }
-      if (due) {
-        held.onDue(held.slot);
-        return;
-      }
-      arm(held);
     });
     held.timer = timer;
   }
 
   return {
-    put(slot, onDue) {
+    put(slot, onDue, onUnarmed) {
       const slots = personaMap(slot.personaId);
       const previous = slots.get(slot.eventId);
       previous?.timer?.cancel();
-      const held: Held = { slot, onDue, timer: null };
+      const held: Held = { slot, onDue, onUnarmed, timer: null };
       slots.set(slot.eventId, held);
       try {
         arm(held);

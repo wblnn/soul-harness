@@ -47,6 +47,7 @@ export type {
   EventRepository,
   ExpireActiveEventInput,
   InsertEventInput,
+  RejectActiveEventInput,
   P1CommitOutcome,
   UpdateEventStatusInput,
 } from './events.js';

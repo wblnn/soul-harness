@@ -532,3 +532,153 @@ describe('events.expireActive', () => {
     expect(storeRepos.events.getById(EVENT)).toMatchObject({ status: 'accepted', updatedAt: NOW });
   });
 });
+
+describe('events.rejectIfActive', () => {
+  it('rejects an accepted P1 event with processing_failed', () => {
+    const storeRepos = repos();
+    seedPersona(storeRepos);
+    storeRepos.events.insert({
+      id: EVENT,
+      personaId: PERSONA,
+      source: SOURCE,
+      adapterId: ADAPTER,
+      adapterEventRef: 'mc-reject',
+      status: 'accepted',
+      attentionOutcome: 'queued',
+      receivedAt: NOW,
+      updatedAt: NOW,
+    });
+
+    const row = storeRepos.events.rejectIfActive({
+      id: EVENT,
+      personaId: PERSONA,
+      updatedAt: NOW + 4,
+      reason: 'processing_failed',
+    });
+
+    expect(row).toMatchObject({
+      status: 'rejected',
+      statusReason: 'processing_failed',
+      attentionOutcome: 'queued',
+      updatedAt: NOW + 4,
+      archiveState: 'none',
+    });
+  });
+
+  it('does not rewrite a terminal row or another persona', () => {
+    const storeRepos = repos();
+    seedPersona(storeRepos);
+    seedPersona(storeRepos, PERSONA_B);
+    storeRepos.events.insert({
+      id: EVENT,
+      personaId: PERSONA,
+      source: SOURCE,
+      adapterId: ADAPTER,
+      adapterEventRef: 'mc-expired',
+      status: 'received',
+      receivedAt: NOW,
+      updatedAt: NOW,
+    });
+    storeRepos.events.updateStatus({
+      id: EVENT,
+      status: 'expired',
+      statusReason: 'ttl_expired',
+      attentionOutcome: null,
+      updatedAt: NOW + 1,
+    });
+    storeRepos.events.insert({
+      id: EVENT_B,
+      personaId: PERSONA_B,
+      source: SOURCE,
+      adapterId: ADAPTER,
+      adapterEventRef: 'mc-b',
+      status: 'accepted',
+      receivedAt: NOW,
+      updatedAt: NOW,
+    });
+
+    expect(
+      storeRepos.events.rejectIfActive({
+        id: EVENT,
+        personaId: PERSONA,
+        updatedAt: NOW + 8,
+        reason: 'processing_failed',
+      }),
+    ).toBeNull();
+    expect(
+      storeRepos.events.rejectIfActive({
+        id: EVENT_B,
+        personaId: PERSONA,
+        updatedAt: NOW + 9,
+        reason: 'processing_failed',
+      }),
+    ).toBeNull();
+    expect(storeRepos.events.getById(EVENT)).toMatchObject({
+      status: 'expired',
+      statusReason: 'ttl_expired',
+    });
+    expect(storeRepos.events.getById(EVENT_B)).toMatchObject({
+      status: 'accepted',
+      personaId: PERSONA_B,
+    });
+  });
+
+  it('does not reject a non-none archive state', () => {
+    const store = openMigratedStore();
+    const storeRepos = createRepositories(store);
+    seedPersona(storeRepos);
+    storeRepos.events.insert({
+      id: EVENT,
+      personaId: PERSONA,
+      source: SOURCE,
+      adapterId: ADAPTER,
+      adapterEventRef: 'mc-arch',
+      status: 'accepted',
+      receivedAt: NOW,
+      updatedAt: NOW,
+    });
+    databaseOf(store)
+      .prepare('UPDATE events SET archive_state = ? WHERE id = ?')
+      .run('pending', EVENT);
+
+    expect(
+      storeRepos.events.rejectIfActive({
+        id: EVENT,
+        personaId: PERSONA,
+        updatedAt: NOW + 2,
+        reason: 'processing_failed',
+      }),
+    ).toBeNull();
+    expect(storeRepos.events.getById(EVENT)).toMatchObject({
+      status: 'accepted',
+      archiveState: 'pending',
+    });
+  });
+
+  it('rejects an expiry reason before writing', () => {
+    const storeRepos = repos();
+    seedPersona(storeRepos);
+    storeRepos.events.insert({
+      id: EVENT,
+      personaId: PERSONA,
+      source: SOURCE,
+      adapterId: ADAPTER,
+      adapterEventRef: 'mc-reason',
+      status: 'accepted',
+      receivedAt: NOW,
+      updatedAt: NOW,
+    });
+
+    expect(
+      codeOf(() =>
+        storeRepos.events.rejectIfActive({
+          id: EVENT,
+          personaId: PERSONA,
+          updatedAt: NOW + 1,
+          reason: 'buffer_lost' as 'processing_failed',
+        }),
+      ),
+    ).toBe('invalid_argument');
+    expect(storeRepos.events.getById(EVENT)?.status).toBe('accepted');
+  });
+});
