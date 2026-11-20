@@ -101,12 +101,14 @@ function lifecycle(
   bootId: BootId = BOOT_A,
   extra: {
     readonly beforeCommit?: (persona: PersonaCommitView) => void | Promise<void>;
+    readonly duringRead?: () => void;
     readonly randomBytes?: (size: number) => Uint8Array;
+    readonly logger?: RuntimeLogger;
   } = {},
 ): PersonaLifecycle {
   return createPersonaLifecycle({
     store: fixture.store,
-    logger: fixture.logger,
+    logger: extra.logger ?? fixture.logger,
     bootId,
     now: () => {
       fixture.time += 1;
@@ -114,7 +116,30 @@ function lifecycle(
     },
     ...(extra.randomBytes === undefined ? {} : { randomBytes: extra.randomBytes }),
     ...(extra.beforeCommit === undefined ? {} : { beforeCommit: extra.beforeCommit }),
+    ...(extra.duringRead === undefined ? {} : { duringRead: extra.duringRead }),
   });
+}
+
+function throwingLogger(method: 'info' | 'warn'): RuntimeLogger {
+  const fail = (): void => {
+    throw new Error('log-failed');
+  };
+  const noop = (): void => {};
+  return {
+    debug: noop,
+    info: method === 'info' ? fail : noop,
+    warn: method === 'warn' ? fail : noop,
+    error: noop,
+  };
+}
+
+/** The call itself must return a promise. A synchronous throw is a failure. */
+function promiseOf(run: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return run();
+  } catch (error) {
+    throw new Error('call threw synchronously', { cause: error });
+  }
 }
 
 function assertNoCanary(fixture: Fixture): void {
@@ -496,7 +521,7 @@ describe('persona lifecycle — crash normalization', () => {
       expectedVersion: 0,
       nextState: 'STARTING',
       updatedAt: 41,
-      bootId: BOOT_A,
+      bootId: BOOT_B,
     });
     store.personas.commitLifecycle({
       id: stopping.id,
@@ -504,7 +529,7 @@ describe('persona lifecycle — crash normalization', () => {
       expectedVersion: 0,
       nextState: 'STOPPING',
       updatedAt: 42,
-      bootId: BOOT_A,
+      bootId: BOOT_B,
     });
     const before = life.listPersonas().length;
 
@@ -515,8 +540,8 @@ describe('persona lifecycle — crash normalization', () => {
       expect(row.state).toBe('STOPPED');
       expect(row.version).toBe(2);
       expect(row.epoch).toBe(1);
-      expect(row.bootId).toBe(BOOT_A);
-      expect(row.runtimeState).toMatchObject({ state: 'STOPPED', epoch: 1, bootId: BOOT_A });
+      expect(row.bootId).toBe(BOOT_B);
+      expect(row.runtimeState).toMatchObject({ state: 'STOPPED', epoch: 1, bootId: BOOT_B });
     }
 
     expect(life.listPersonas()).toHaveLength(before);
@@ -686,5 +711,194 @@ describe('persona lifecycle — arguments', () => {
     expect(await codeOf(() => life.getPersona('not-a-persona' as PersonaId))).toBe(
       'invalid_argument',
     );
+  });
+});
+
+describe('persona lifecycle — logger failures stay diagnostic', () => {
+  it('returns the committed persona when info logging throws after create', async () => {
+    const fixture = openFixture();
+    const life = lifecycle(fixture, BOOT_A, { logger: throwingLogger('info') });
+    const pending = promiseOf(() => life.createPersona({ displayName: 'Logged' }));
+    const created = (await pending) as PersonaSnapshot;
+    expect(created).toMatchObject({
+      state: 'CREATED',
+      version: 0,
+      epoch: 1,
+      runtimeState: { state: 'CREATED', epoch: 1 },
+    });
+    expect(reposOf(fixture.store).personas.getById(created.id)).toMatchObject({
+      state: 'CREATED',
+      version: 0,
+    });
+  });
+
+  it('finishes RUNNING when info logging throws after the STARTING commit', async () => {
+    const fixture = openFixture();
+    const plain = lifecycle(fixture);
+    const created = await plain.createPersona({ displayName: 'Phase' });
+    const life = lifecycle(fixture, BOOT_A, { logger: throwingLogger('info') });
+    const started = (await promiseOf(() => life.startPersona(created.id))) as PersonaSnapshot;
+    expect(started).toMatchObject({
+      state: 'RUNNING',
+      version: 2,
+      bootId: BOOT_A,
+      runtimeState: { state: 'RUNNING', bootId: BOOT_A },
+    });
+    expect(reposOf(fixture.store).personas.getById(created.id)?.state).toBe('RUNNING');
+  });
+
+  it('still rejects with illegal_transition when the warn logger throws', async () => {
+    const fixture = openFixture();
+    const plain = lifecycle(fixture);
+    const created = await plain.createPersona({ displayName: 'Illegal' });
+    const life = lifecycle(fixture, BOOT_A, { logger: throwingLogger('warn') });
+    const pending = promiseOf(() => life.suspendPersona(created.id));
+    await expect(pending).rejects.toMatchObject({
+      name: 'RuntimeError',
+      code: 'illegal_transition',
+    });
+    await expect(pending).rejects.not.toMatchObject({ message: 'log-failed' });
+    expect(reposOf(fixture.store).personas.getById(created.id)?.state).toBe('CREATED');
+  });
+});
+
+describe('persona lifecycle — crash normalize boot boundary', () => {
+  it('normalizes other boots and leaves rows owned by this boot', async () => {
+    const fixture = openFixture();
+    const life = lifecycle(fixture, BOOT_A);
+    const store = reposOf(fixture.store);
+
+    async function seed(label: string, state: 'STARTING' | 'STOPPING', bootId: BootId | null) {
+      const created = await life.createPersona({ displayName: label });
+      const written = store.personas.commitLifecycle({
+        id: created.id,
+        expectedState: 'CREATED',
+        expectedVersion: 0,
+        nextState: state,
+        updatedAt: 80,
+        ...(bootId === null ? {} : { bootId }),
+      });
+      expect(written?.persona.bootId ?? null).toBe(bootId);
+      return created.id;
+    }
+
+    const oldStarting = await seed('old-start', 'STARTING', BOOT_B);
+    const oldStopping = await seed('old-stop', 'STOPPING', BOOT_B);
+    const unstamped = await seed('unstamped', 'STARTING', null);
+    const ownStarting = await seed('own-start', 'STARTING', BOOT_A);
+    const ownStopping = await seed('own-stop', 'STOPPING', BOOT_A);
+
+    const normalized = await life.normalizeCrashedPersonas();
+    expect(normalized.map((row) => row.id).sort()).toEqual(
+      [oldStarting, oldStopping, unstamped].sort(),
+    );
+    for (const row of normalized) {
+      expect(row).toMatchObject({ state: 'STOPPED', version: 2, epoch: 1 });
+      expect(row.runtimeState?.state).toBe('STOPPED');
+      expect(row.runtimeState?.epoch).toBe(1);
+    }
+    expect(life.getPersona(ownStarting)).toMatchObject({
+      state: 'STARTING',
+      version: 1,
+      bootId: BOOT_A,
+    });
+    expect(life.getPersona(ownStopping)).toMatchObject({
+      state: 'STOPPING',
+      version: 1,
+      bootId: BOOT_A,
+    });
+  });
+
+  it('does not let a same-boot normalize clobber an in-flight start', async () => {
+    const fixture = openFixture();
+    const normalizer = lifecycle(fixture, BOOT_A);
+    const starter = lifecycle(fixture, BOOT_A, {
+      beforeCommit: (view) => {
+        if (view.state !== 'STARTING') {
+          return undefined;
+        }
+        return normalizer.normalizeCrashedPersonas().then((rows) => {
+          expect(rows).toEqual([]);
+        });
+      },
+    });
+    const created = await normalizer.createPersona({ displayName: 'InFlight' });
+    const started = await starter.startPersona(created.id);
+    expect(started).toMatchObject({
+      id: created.id,
+      state: 'RUNNING',
+      version: 2,
+      bootId: BOOT_A,
+      epoch: 1,
+    });
+    expect(reposOf(fixture.store).personas.list()).toHaveLength(1);
+  });
+});
+
+describe('persona lifecycle — consistent reads', () => {
+  it('keeps persona and runtime_state paired when another connection commits mid-read', async () => {
+    const fixture = openFixture();
+    const created = await lifecycle(fixture).createPersona({ displayName: 'Paired' });
+    const other = openStore({ file: fixture.store.file });
+    const writer = reposOf(other).runtimeState;
+    const writeStopped = (): void => {
+      writer.upsert({
+        personaId: created.id,
+        state: 'STOPPED',
+        bootId: null,
+        epoch: 1,
+        updatedAt: 9_000,
+      });
+    };
+    const park = (): void => {
+      writer.upsert({
+        personaId: created.id,
+        state: 'CREATED',
+        bootId: null,
+        epoch: 1,
+        updatedAt: 1,
+      });
+    };
+    const reader = lifecycle(fixture, BOOT_A, { duringRead: writeStopped });
+    try {
+      expect(reader.getPersona(created.id)).toMatchObject({
+        state: 'CREATED',
+        runtimeState: { state: 'CREATED' },
+      });
+
+      park();
+      const listed = reader.listPersonas();
+      expect(listed).toHaveLength(1);
+      expect(listed[0]).toMatchObject({
+        state: 'CREATED',
+        runtimeState: { state: 'CREATED' },
+      });
+
+      park();
+      expect(reader.queryPersonas({ state: 'CREATED' })[0]?.runtimeState?.state).toBe('CREATED');
+
+      expect(lifecycle(fixture).getPersona(created.id)).toMatchObject({
+        state: 'CREATED',
+        runtimeState: { state: 'STOPPED' },
+      });
+    } finally {
+      other.close();
+    }
+  });
+});
+
+describe('persona lifecycle — promise rejection', () => {
+  it('rejects invalid input on the returned promise', async () => {
+    const fixture = openFixture();
+    const life = lifecycle(fixture);
+    const created = promiseOf(() => life.createPersona({ displayName: '' }));
+    await expect(created).rejects.toMatchObject({ code: 'invalid_argument' });
+    expect(life.listPersonas()).toEqual([]);
+
+    const started = promiseOf(() => life.startPersona('not-a-persona' as PersonaId));
+    await expect(started).rejects.toMatchObject({
+      name: 'RuntimeError',
+      code: 'invalid_argument',
+    });
   });
 });

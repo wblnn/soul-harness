@@ -38,7 +38,7 @@
 | `suspendPersona` / `resumePersona` | 仅 `RUNNING` → `SUSPENDED`，以及 `SUSPENDED` → `RUNNING`。恢复时盖上当前 `bootId` |
 | `stopPersona` | **任意状态**都可以调用。除下面两种之外，先 `STOPPING` 再 `STOPPED`。已是 `STOPPING` 则直接收成 `STOPPED`。已是 `STOPPED` 则成功返回，version 不变 |
 | `restorePersona` | 按已有 id 读回。不分配、不插入。没有这行则 `not_found` |
-| `normalizeCrashedPersonas` | 把 `STARTING` / `STOPPING` 直接收成 `STOPPED`。不自动 start。其它状态不动 |
+| `normalizeCrashedPersonas` | 把**其它 boot**（含尚未盖 `bootId`）留下的 `STARTING` / `STOPPING` 直接收成 `STOPPED`。`bootId` 已经是本生命周期的行视为本进程正在进行的启停，不归一。不自动 start。其它状态不动 |
 
 写路径：
 
@@ -47,9 +47,13 @@
 - **不提升 epoch。** 提交时 persistence 从人格行抄出现有 epoch。
 - `runtime_state` 在同一次写事务里镜像 `state` / `boot_id` / `epoch` / `updated_at`。`checkpoint_json` 不在这条语句里，已有检查点不会被生命周期写掉，本批也不装载、也不新写检查点。
 - 同一 `personaId` 的写操作进一条内存队列，按调用顺序一个接一个执行。不同人格各用各的队列，不共用缓冲。SQLite 仍是全库单写入者。
-- 日志只有 id、状态、version、epoch、bootId、操作名。不写 `displayName`。
+- 日志只有 id、状态、version、epoch、bootId、操作名。不写 `displayName`。诊断日志走 `safeLog`：日志实现抛错时吞掉，不改变已提交的结果，也不把 `illegal_transition` 换成日志异常。
+- `get` / `list` / `query` / `restore` 在同一次 `withRead` 里读 `personas` 和 `runtime_state`。另一次连接在这两次读取之间提交，本连接仍返回进入读事务时的那一对。
+- 返回 Promise 的方法（创建、start / suspend / resume / stop、归一）在参数不合法时**拒绝这个 Promise**，不在调用当场抛出。读操作和 `restorePersona` 仍是同步的。
 
-`FAILED` 可以被 `stop`（任意状态都允许停），但不能 `start` / `suspend` / `resume`。本批没有「进入 FAILED」的操作：启动路径上没有认知装载可以失败。留下 `STARTING` 的进程，靠归一收到 `STOPPED`，再显式 `start`。
+归一的进程级前提（SH-008E 才由 Daemon 强制，本批只写明并在 boot 边界上守住）：Supervisor 在独占的 `RECOVERING` 阶段调用 `normalizeCrashedPersonas`，并且发生在本 boot 对任何人格 `start` / `stop` 之前。bootId 检查避免把本进程已经盖上章的启停收成 `STOPPED`；它不能代替「只有一个 Supervisor」这条约定。条件写仍是 version CAS，扫描之后被别人改过的行不会被覆盖。
+
+`FAILED` 可以被 `stop`（任意状态都允许停），但不能 `start` / `suspend` / `resume`。本批没有「进入 FAILED」的操作：启动路径上没有认知装载可以失败。其它 boot 留下的 `STARTING` 靠归一收到 `STOPPED`，再显式 `start`。
 
 ## 2. 不负责什么
 
@@ -70,12 +74,14 @@
 | 图上只画了 `CREATED → STARTING` | `start` 也接受 `STOPPED`。§4 要求崩溃归一之后显式重启，重启的落点就是 `STOPPED` |
 | `stop` 从任意状态进入 `STOPPING` | 已经是 `STOPPED` 时不再绕一圈（version 不变）。已经是 `STOPPING` 时收成 `STOPPED`，只 +1 |
 | 启动要装载检查点，停止要先写检查点 | **不做。** 那是 SH-008E。本批的 `STARTING` / `STOPPING` 只提交状态行 |
-| 崩溃归一由 Daemon 在 RECOVERING 调用 | 函数在本包。`phases.ts` 仍是 `not_implemented`，本批不改 Daemon |
+| 崩溃归一由 Daemon 在 RECOVERING 调用 | 函数在本包，且只收其它 boot 留下的 `STARTING` / `STOPPING`。`phases.ts` 仍是 `not_implemented`。独占 RECOVERING、且先于本 boot 启停，由 SH-008E 接线 |
 | 图上有「任意失败 → FAILED」 | 没有 `failPersona`。`FAILED` 只作为已存在的状态被识别 |
 
 `displayName` 长度 1..128（`PERSONA_DISPLAY_NAME_MAX_LENGTH`）、拒绝首尾空白和控制字符，是本批的入口限制。表本身没有这个 CHECK。
 
 `beforeCommit` 是测试缝，生产调用省略。它在判定合法之后、条件写之前运行；返回的 Promise 会在队列里被等待，用来观察 `version_conflict`。
+
+`duringRead` 也是测试缝。它在同一次读事务里、人格行已经读出、`runtime_state` 尚未读出时运行，用来让另一个连接在中间提交。
 
 ## 4. 目录
 
@@ -86,10 +92,10 @@ packages/runtime/
 │  ├─ errors.ts                     # RuntimeError
 │  ├─ ids/{encode,allocate}.ts      # 冻结编码与分配
 │  └─ persona/{lifecycle,queue}.ts  # 状态机与人格级写队列
-└─ test/                            # 45 项
+└─ test/                            # 52 项
    ├─ allocator.test.ts             # 29 项。向量、时钟、碰撞、SQLite 主键
    ├─ allocator-sample.test.ts      # 2 项。OPEN-7 大样本
-   └─ persona-lifecycle.test.ts     # 14 项。真实 SQLite 上的生命周期
+   └─ persona-lifecycle.test.ts     # 21 项。真实 SQLite 上的生命周期
 ```
 
 ## 5. 依赖
@@ -120,7 +126,7 @@ allocateConflictRecordId(options?): ConflictRecordId
 
 `AllocateOptions` 见 SH-008A：`now` / `randomBytes` / `isOccupied` / `maxAttempts`。
 
-生命周期（写操作返回 Promise，因为要排队；读操作是同步的）：
+生命周期（写操作返回 Promise，因为要排队；参数错误也拒绝该 Promise。读操作是同步的）：
 
 ```ts
 createPersonaLifecycle(options): PersonaLifecycle
@@ -145,7 +151,7 @@ normalizeCrashedPersonas(): Promise<readonly PersonaSnapshot[]>
 |---|---|
 | `test/allocator.test.ts` | 29 项。已知向量、前缀不可混用、时钟进退、碰撞重试、真实 SQLite 主键冲突不覆盖、`src/` 无 SQL / 无环境读取，且只依赖 contracts 与 persistence |
 | `test/allocator-sample.test.ts` | 2 项。每个前缀 10000 个 ID，另加同毫秒突发 10000 个；全部通过 contracts 的 `is*` / `parse*`，样本内唯一 |
-| `test/persona-lifecycle.test.ts` | 14 项。真实迁移后的 SQLite：合法与非法转移、任意状态 stop、崩溃归一、按 ID 恢复且不新建、多人格隔离、同人格并发、过期 version 不覆盖、epoch 不变、检查点不被生命周期写掉、分页列表 |
+| `test/persona-lifecycle.test.ts` | 21 项。真实迁移后的 SQLite：合法与非法转移、任意状态 stop、按 boot 区分的崩溃归一、按 ID 恢复且不新建、多人格隔离、同人格并发、过期 version 不覆盖、epoch 不变、检查点不被生命周期写掉、分页列表、日志失败不掩盖提交、双连接读快照、非法参数拒绝 Promise |
 
 OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」写成验收。
 
@@ -156,7 +162,7 @@ OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」
 1. 分配 `runId` 不会把历史尝试写入 `runs` 表——P1 没有这张表（OPEN-1，2026-11-20）。
 2. 占用检测在创建人格时接的是 `getById`。分配器自己看不到唯一索引；索引冲突变成 `id_collision`。
 3. 重试上限 8 是 SH-008A 的实现选择，不是协议里的新常数。
-4. 本包被构建、被测试，**不表示** Daemon 已经在恢复人格或受理事件。`normalizeCrashedPersonas` 不会自己在进程启动时跑。
+4. 本包被构建、被测试，**不表示** Daemon 已经在恢复人格或受理事件。`normalizeCrashedPersonas` 不会自己在进程启动时跑。调用它的独占 `RECOVERING` 顺序属于 SH-008E。
 5. 读操作不进写队列，因此可能看见 `STARTING` / `STOPPING` 这两个已经提交的中间态。
 6. 已经 `STOPPED` 的 `stop` 不会顺便修理一张和人格行不一致的 `runtime_state`。正常路径的写入是一起提交的。
 7. 没有事件受理、任务调度、扫描 A/B、检查点编排，也没有 HTTP。

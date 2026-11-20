@@ -13,8 +13,9 @@
  *   - no caller-supplied persona id
  *   - no epoch increment. Forgotten content is a later phase. The stored
  *     epoch is copied by the persistence commit and never sent as a new value
- *   - no automatic start after a crash. STARTING and STOPPING become STOPPED
- *     and wait for an explicit start
+ *   - no automatic start after a crash. STARTING and STOPPING left by another
+ *     boot become STOPPED and wait for an explicit start. Rows this boot
+ *     already owns stay as they are
  */
 
 import { isBootId, isPersonaId } from '@soul-harness/contracts';
@@ -81,6 +82,14 @@ export interface PersonaLifecycleOptions {
    * following commit fail with `version_conflict`.
    */
   readonly beforeCommit?: (persona: PersonaCommitView) => void | Promise<void>;
+  /**
+   * Test seam. Production callers omit it.
+   *
+   * Invoked inside the read transaction after the persona row (or page) has
+   * been read and before `runtime_state` is read. A second connection can
+   * commit there; this connection must still return the pre-commit pair.
+   */
+  readonly duringRead?: () => void;
 }
 
 /** Runtime row as observed with the persona. `null` when the mirror is missing. */
@@ -124,8 +133,16 @@ export interface PersonaLifecycle {
    */
   restorePersona(personaId: PersonaId): PersonaSnapshot;
   /**
-   * STARTING and STOPPING become STOPPED. Nothing is started.
-   * Other states, including FAILED, are left untouched. Epoch is not changed.
+   * Old-boot STARTING and STOPPING become STOPPED. Nothing is started.
+   *
+   * A row whose `bootId` is already this lifecycle's boot id is in-flight work
+   * of the current boot and is not a crash leftover. Epoch is not changed.
+   * Other states, including FAILED, are left untouched.
+   *
+   * Precondition, enforced by the Daemon in SH-008E and not here: the
+   * supervisor calls this during its exclusive RECOVERING phase, before this
+   * boot starts or stops any persona. The boot id check is the local guard
+   * for that window; it does not replace the single-supervisor rule.
    */
   normalizeCrashedPersonas(): Promise<readonly PersonaSnapshot[]>;
 }
@@ -151,8 +168,23 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
     return value;
   }
 
-  function snapshotOf(persona: PersonaRow, runtimeState?: RuntimeStateRow | null): PersonaSnapshot {
-    const runtime = runtimeState === undefined ? repos.runtimeState.get(persona.id) : runtimeState;
+  /**
+   * Diagnostic only. A throwing logger must not hide a committed row or
+   * replace `illegal_transition` / `version_conflict` with the logger's error.
+   */
+  function safeLog(
+    level: 'debug' | 'info' | 'warn' | 'error',
+    event: string,
+    fields?: RuntimeLogFields,
+  ): void {
+    try {
+      options.logger[level](event, fields);
+    } catch {
+      // The business result is already decided. Swallow the diagnostic failure.
+    }
+  }
+
+  function toSnapshot(persona: PersonaRow, runtime: RuntimeStateRow | null): PersonaSnapshot {
     return {
       id: persona.id,
       displayName: persona.displayName,
@@ -174,32 +206,52 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
     };
   }
 
-  function readAllRows(): readonly PersonaRow[] {
-    return withRead(options.store, () => {
-      const rows: PersonaRow[] = [];
-      let afterId: PersonaId | undefined;
-      for (;;) {
-        const page = repos.personas.listPage({
-          limit: MAX_LIST_LIMIT,
-          ...(afterId === undefined ? {} : { afterId }),
-        });
-        rows.push(...page);
-        if (page.length < MAX_LIST_LIMIT) {
-          return rows;
-        }
-        const last = page[page.length - 1];
-        if (last === undefined) {
-          return rows;
-        }
-        afterId = last.id;
+  function pagePersonaRows(): readonly PersonaRow[] {
+    const rows: PersonaRow[] = [];
+    let afterId: PersonaId | undefined;
+    for (;;) {
+      const page = repos.personas.listPage({
+        limit: MAX_LIST_LIMIT,
+        ...(afterId === undefined ? {} : { afterId }),
+      });
+      rows.push(...page);
+      if (page.length < MAX_LIST_LIMIT) {
+        return rows;
       }
+      const last = page[page.length - 1];
+      if (last === undefined) {
+        return rows;
+      }
+      afterId = last.id;
+    }
+  }
+
+  /**
+   * Persona row and its runtime row, from one read transaction.
+   *
+   * `duringRead` runs after the persona read and before the runtime read so a
+   * test can commit on another connection in between. Both selects stay on
+   * this transaction's snapshot.
+   */
+  function loadOne(personaId: PersonaId): PersonaSnapshot | null {
+    return withRead(options.store, () => {
+      const persona = repos.personas.getById(personaId);
+      options.duringRead?.();
+      if (persona === null) {
+        return null;
+      }
+      return toSnapshot(persona, repos.runtimeState.get(personaId));
     });
   }
 
-  function query(state: PersonaState | undefined): readonly PersonaSnapshot[] {
-    return readAllRows()
-      .filter((row) => state === undefined || row.state === state)
-      .map((row) => snapshotOf(row));
+  function loadAll(state: PersonaState | undefined): readonly PersonaSnapshot[] {
+    return withRead(options.store, () => {
+      const rows = pagePersonaRows();
+      options.duringRead?.();
+      return rows
+        .filter((row) => state === undefined || row.state === state)
+        .map((row) => toSnapshot(row, repos.runtimeState.get(row.id)));
+    });
   }
 
   function requireRow(personaId: PersonaId, operation: string): PersonaRow {
@@ -244,7 +296,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
       ...(bootId === undefined ? {} : { bootId }),
     });
     if (written === null) {
-      options.logger.warn('persona.version_conflict', {
+      safeLog('warn', 'persona.version_conflict', {
         personaId: row.id,
         from: row.state,
         expectedVersion: row.version,
@@ -259,7 +311,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
         },
       });
     }
-    options.logger.info('persona.transition', {
+    safeLog('info', 'persona.transition', {
       personaId: row.id,
       from: row.state,
       to: next,
@@ -268,7 +320,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
       operation,
       bootId: options.bootId,
     });
-    return snapshotOf(written.persona, written.runtimeState);
+    return toSnapshot(written.persona, written.runtimeState);
   }
 
   async function runOperation(
@@ -280,7 +332,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
       const current = requireRow(personaId, operation);
       const steps = planSteps(operation, current.state);
       if (steps === null) {
-        options.logger.warn('persona.transition_rejected', {
+        safeLog('warn', 'persona.transition_rejected', {
           personaId,
           from: current.state,
           operation,
@@ -295,10 +347,16 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
         );
       }
       if (steps.length === 0) {
-        return snapshotOf(current);
+        const snapshot = loadOne(personaId);
+        if (snapshot === null) {
+          throw new RuntimeError('not_found', 'persona does not exist', {
+            details: { operation },
+          });
+        }
+        return snapshot;
       }
       let row = current;
-      let snapshot = snapshotOf(current);
+      let snapshot: PersonaSnapshot | undefined;
       for (const next of steps) {
         snapshot = await commitStep(row, next, operation, bootFor(operation, next));
         const updated = repos.personas.getById(personaId);
@@ -309,8 +367,21 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
         }
         row = updated;
       }
+      if (snapshot === undefined) {
+        throw new RuntimeError(
+          'illegal_transition',
+          'persona state does not allow this operation',
+          {
+            details: { from: current.state, operation },
+          },
+        );
+      }
       return snapshot;
     });
+  }
+
+  function ownedByThisBoot(bootId: BootId | null): boolean {
+    return bootId === options.bootId;
   }
 
   function bootFor(
@@ -327,7 +398,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
   }
 
   return {
-    createPersona(input) {
+    async createPersona(input) {
       if (typeof input !== 'object' || input === null) {
         throw new RuntimeError('invalid_argument', 'createPersona input must be an object');
       }
@@ -350,14 +421,14 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
             createdAt: now,
             updatedAt: now,
           });
-          options.logger.info('persona.created', {
+          safeLog('info', 'persona.created', {
             personaId: id,
             state: written.persona.state,
             version: written.persona.version,
             epoch: written.persona.epoch,
             bootId: options.bootId,
           });
-          return snapshotOf(written.persona, written.runtimeState);
+          return toSnapshot(written.persona, written.runtimeState);
         } catch (error) {
           if (isPersistenceError(error) && error.code === 'unique_conflict') {
             throw new RuntimeError('id_collision', 'persona id collided on insert', {
@@ -371,12 +442,11 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
 
     getPersona(personaId) {
       assertPersonaId(personaId);
-      const row = repos.personas.getById(personaId);
-      return row === null ? null : snapshotOf(row);
+      return loadOne(personaId);
     },
 
     listPersonas() {
-      return query(undefined);
+      return loadAll(undefined);
     },
 
     queryPersonas(queryInput) {
@@ -388,7 +458,7 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
           details: { field: 'state' },
         });
       }
-      return query(queryInput.state);
+      return loadAll(queryInput.state);
     },
 
     startPersona(personaId) {
@@ -408,19 +478,40 @@ export function createPersonaLifecycle(options: PersonaLifecycleOptions): Person
     },
 
     restorePersona(personaId) {
-      return snapshotOf(requireRow(personaId, 'restore'));
+      assertPersonaId(personaId);
+      const snapshot = loadOne(personaId);
+      if (snapshot === null) {
+        throw new RuntimeError('not_found', 'persona does not exist', {
+          details: { operation: 'restore' },
+        });
+      }
+      return snapshot;
     },
 
     async normalizeCrashedPersonas() {
-      const crashed = readAllRows().filter((row) => isCrashState(row.state));
+      // Scan outside any persona queue. The queued body re-reads and CAS-es,
+      // so a row this boot claims after the scan is not overwritten.
+      const crashed = withRead(options.store, () => pagePersonaRows()).filter(
+        (row) => isCrashState(row.state) && !ownedByThisBoot(row.bootId),
+      );
       const changed: PersonaSnapshot[] = [];
       for (const candidate of crashed) {
         const snapshot = await queue.run(candidate.id, async () => {
           const current = repos.personas.getById(candidate.id);
-          if (current === null || !isCrashState(current.state)) {
+          if (current === null || !isCrashState(current.state) || ownedByThisBoot(current.bootId)) {
             return null;
           }
-          return commitStep(current, 'STOPPED', 'normalize', undefined);
+          try {
+            return await commitStep(current, 'STOPPED', 'normalize', undefined);
+          } catch (error) {
+            if (error instanceof RuntimeError && error.code === 'version_conflict') {
+              const again = repos.personas.getById(candidate.id);
+              if (again === null || !isCrashState(again.state) || ownedByThisBoot(again.bootId)) {
+                return null;
+              }
+            }
+            throw error;
+          }
         });
         if (snapshot !== null) {
           changed.push(snapshot);
@@ -541,6 +632,11 @@ function assertOptions(options: PersonaLifecycleOptions): void {
   if (options.beforeCommit !== undefined && typeof options.beforeCommit !== 'function') {
     throw new RuntimeError('invalid_argument', 'beforeCommit must be a function', {
       details: { field: 'beforeCommit' },
+    });
+  }
+  if (options.duringRead !== undefined && typeof options.duringRead !== 'function') {
+    throw new RuntimeError('invalid_argument', 'duringRead must be a function', {
+      details: { field: 'duringRead' },
     });
   }
   const logger: RuntimeLogger | undefined = options.logger;
