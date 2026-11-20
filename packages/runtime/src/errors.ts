@@ -16,6 +16,8 @@ export const RUNTIME_ERROR_CODES = [
   'not_found',
   'illegal_transition',
   'version_conflict',
+  'schema_invalid',
+  'closed',
 ] as const;
 
 export type RuntimeErrorCode = (typeof RUNTIME_ERROR_CODES)[number];

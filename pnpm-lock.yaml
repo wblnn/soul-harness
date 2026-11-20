@@ -79,6 +79,9 @@ importers:
       '@soul-harness/persistence':
         specifier: workspace:*
         version: link:../persistence
+      ajv:
+        specifier: ^8.20.0
+        version: 8.20.0
     devDependencies:
       '@types/node':
         specifier: ^24.19.2

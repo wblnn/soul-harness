@@ -111,17 +111,15 @@ try {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-// --- runtime: allocator plus in-process persona lifecycle, nothing later -----
+// --- runtime: allocator, persona lifecycle, and in-process ingress ----------
 
-for (const absent of [
-  'createRuntime',
-  'acceptStimulus',
-  'enqueueTask',
-  'recover',
-  'checkpointAll',
-]) {
+for (const absent of ['createRuntime', 'enqueueTask', 'recover', 'checkpointAll']) {
   assert.equal(absent in runtime, false, `${absent} must not be exported yet`);
 }
+
+assert.equal('acceptStimulus' in runtime, false, 'acceptStimulus is a method, not a free function');
+assert.equal(typeof runtime.createStimulusIngress, 'function');
+assert.equal(runtime.DEDUPE_BODY_UNVERIFIABLE_METRIC, 'dedupe.body_unverifiable');
 
 assert.equal(typeof runtime.createPersonaLifecycle, 'function');
 assert.equal(runtime.PERSONA_DISPLAY_NAME_MAX_LENGTH, 128);
@@ -205,11 +203,56 @@ try {
     life.startPersona(created.id),
     (error) => runtime.isRuntimeError(error) && error.code === 'illegal_transition',
   );
+  const bus = runtime.createStimulusIngress({
+    store: runtimeStore,
+    logger: noop,
+    now: () => 8_000,
+    config: { queueCapacity: 2, bufferTtlMs: 1_000 },
+  });
+  const canary = 'consumer-canary-body';
+  const accepted = await bus.acceptStimulus({
+    stimulus: {
+      schema: STIMULUS_INPUT_VERSION,
+      personaId: created.id,
+      adapterId: 'minecraft',
+      source: 'minecraft.chat',
+      adapterEventRef: 'mc-consumer',
+      requestNonce: 'NQ7xK2mR9tVb4Wc8',
+      payload: { kind: 'mc.world', version: 1, text: canary },
+    },
+  });
+  assert.equal(accepted.outcome, 'accepted');
+  assert.equal(accepted.audited, false);
+  assert.equal(accepted.receivedAt, 8_000);
+  assert.equal(accepted.archiveState, 'none');
+  const again = await bus.acceptStimulus({
+    stimulus: {
+      schema: STIMULUS_INPUT_VERSION,
+      personaId: created.id,
+      adapterId: 'minecraft',
+      source: 'minecraft.chat',
+      adapterEventRef: 'mc-consumer',
+      requestNonce: 'NQ7xK2mR9tVb4Wc8',
+      payload: { kind: 'mc.world', version: 1, text: 'different-body' },
+    },
+  });
+  assert.equal(again.outcome, 'duplicate');
+  assert.equal(again.eventId, accepted.eventId);
+  assert.equal(again.bodyVerified, false);
+  assert.equal(bus.metrics()[runtime.DEDUPE_BODY_UNVERIFIABLE_METRIC], 1);
+  const buffered = bus.readBuffered(created.id, accepted.eventId);
+  assert.equal(buffered.payload.text, canary);
+  const stored = persistence.createRepositories(runtimeStore).events.getById(accepted.eventId);
+  assert.equal(stored.status, 'accepted');
+  assert.equal(stored.archiveState, 'none');
+  assert.equal(stored.summary, null);
+  assert.equal(JSON.stringify(stored).includes(canary), false);
+  bus.close();
   runtimeStore.close();
 } finally {
   rmSync(runtimeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
 console.log(
-  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime persona lifecycle ok`,
+  `consumer-check ok: package-name imports resolved, ${SCHEMA_IDS.length} schemas, persistence E2E ok, runtime persona lifecycle and P1 ingress ok`,
 );

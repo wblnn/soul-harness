@@ -32,11 +32,24 @@ export type {
   UpdatePersonaStateInput,
 } from './personas.js';
 
-export { createSessionRepository } from './sessions.js';
-export type { CloseSessionInput, InsertSessionInput, SessionRepository } from './sessions.js';
+export { ACTIVE_SESSION_EXTERNAL_ID_MAX_LENGTH, createSessionRepository } from './sessions.js';
+export type {
+  CloseSessionInput,
+  InsertSessionInput,
+  OpenActiveSessionInput,
+  OpenActiveSessionResult,
+  SessionRepository,
+} from './sessions.js';
 
 export { createEventRepository } from './events.js';
-export type { EventRepository, InsertEventInput, UpdateEventStatusInput } from './events.js';
+export type {
+  CommitP1EventInput,
+  EventRepository,
+  ExpireActiveEventInput,
+  InsertEventInput,
+  P1CommitOutcome,
+  UpdateEventStatusInput,
+} from './events.js';
 
 export { createTaskRepository } from './tasks.js';
 export type { InsertTaskInput, TaskRepository, UpdateTaskStateInput } from './tasks.js';

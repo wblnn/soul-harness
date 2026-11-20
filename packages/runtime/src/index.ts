@@ -9,12 +9,17 @@
  * Create, query, start, suspend, resume, stop, restore by id, and normalize
  * STARTING / STOPPING to STOPPED. No epoch bump.
  *
+ * SH-008C: in-process P1 ingress. Validate the stimulus, dedupe without
+ * comparing bodies, map sessions, commit the envelope, and hold the body in
+ * a per-persona TTL buffer. No Archive, no HTTP, no scheduler.
+ *
  * What this package is NOT yet, and must not pretend to be:
- *   - no event bus, scheduler, recovery scans, or checkpoint load/save
+ *   - no scheduler, recovery scans, or checkpoint load/save
  *   - no Daemon wiring and no HTTP surface
  *   - no SQL in this package; persistence owns every statement
  *   - no Archive, Action Gateway, or Dream Sandbox
  *   - no path that accepts an externally chosen internal id
+ *   - no claim that P1 `accepted` means audited, understood, or remembered
  */
 
 export { RUNTIME_ERROR_CODES, RuntimeError, isRuntimeError } from './errors.js';
@@ -47,3 +52,22 @@ export {
   allocateThreadId,
 } from './ids/allocate.js';
 export type { AllocateOptions, AllocatablePrefix } from './ids/allocate.js';
+
+export { DEDUPE_BODY_UNVERIFIABLE_METRIC, createStimulusIngress } from './events/bus.js';
+export type {
+  AcceptStimulusInput,
+  BufferedStimulus,
+  IngressAccepted,
+  IngressChannelLimits,
+  IngressDuplicate,
+  IngressMetrics,
+  IngressPersistView,
+  IngressRefused,
+  IngressResult,
+  QueuedStimulus,
+  StimulusIngress,
+  StimulusIngressConfig,
+  StimulusIngressOptions,
+  TtlClose,
+} from './events/bus.js';
+export type { IngressScheduler, IngressTimer } from './events/buffer.js';

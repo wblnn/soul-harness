@@ -1,0 +1,228 @@
+/**
+ * Per-persona TTL buffer (SH-008C).
+ *
+ * The stimulus body lives only in this map. Nothing here writes a database,
+ * a checkpoint, or a log. Each persona has its own map; a lookup never
+ * crosses that boundary.
+ *
+ * Timers are cancellable. `clear` drops every body and every handle. A long
+ * TTL is sliced so a single timer delay stays inside the platform range, and
+ * the slice reschedules until `expiresAt`.
+ */
+
+import type { EventId, PersonaId, SourceId, StimulusPayload } from '@soul-harness/contracts';
+
+/** Largest delay `setTimeout` accepts without wrapping. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+export interface IngressTimer {
+  cancel(): void;
+}
+
+export interface IngressScheduler {
+  schedule(delayMs: number, fire: () => void): IngressTimer;
+}
+
+export function createDefaultIngressScheduler(): IngressScheduler {
+  return {
+    schedule(delayMs, fire) {
+      const handle = setTimeout(fire, delayMs);
+      return {
+        cancel() {
+          clearTimeout(handle);
+        },
+      };
+    },
+  };
+}
+
+export interface BufferSlot {
+  readonly personaId: PersonaId;
+  readonly eventId: EventId;
+  readonly source: SourceId;
+  readonly receivedAt: number;
+  readonly occurredAt: number | null;
+  readonly expiresAt: number;
+  readonly payload: StimulusPayload;
+}
+
+export interface PerceptionBuffer {
+  put(slot: BufferSlot, onDue: (slot: BufferSlot) => void): void;
+  peek(personaId: PersonaId, eventId: EventId): BufferSlot | null;
+  /** Occupied slots for one persona and one source, including ones already due. */
+  count(personaId: PersonaId, source: SourceId): number;
+  list(personaId: PersonaId): readonly BufferSlot[];
+  due(personaId: PersonaId, now: number): readonly BufferSlot[];
+  dueAll(now: number): readonly BufferSlot[];
+  /** Drops the body and cancels its timer. */
+  take(personaId: PersonaId, eventId: EventId): BufferSlot | null;
+  rearm(personaId: PersonaId, eventId: EventId): void;
+  clear(): void;
+}
+
+interface Held {
+  readonly slot: BufferSlot;
+  onDue: (slot: BufferSlot) => void;
+  timer: IngressTimer | null;
+}
+
+export function createPerceptionBuffer(options: {
+  readonly now: () => number;
+  readonly scheduler: IngressScheduler;
+}): PerceptionBuffer {
+  const byPersona = new Map<string, Map<string, Held>>();
+
+  function personaMap(personaId: string): Map<string, Held> {
+    const existing = byPersona.get(personaId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created = new Map<string, Held>();
+    byPersona.set(personaId, created);
+    return created;
+  }
+
+  function lookup(personaId: string, eventId: string): Held | null {
+    return byPersona.get(personaId)?.get(eventId) ?? null;
+  }
+
+  function forgetPersonaIfEmpty(personaId: string, slots: Map<string, Held>): void {
+    if (slots.size === 0) {
+      byPersona.delete(personaId);
+    }
+  }
+
+  function arm(held: Held): void {
+    held.timer?.cancel();
+    held.timer = null;
+    const remaining = held.slot.expiresAt - options.now();
+    const delay = remaining <= 0 ? 0 : Math.min(remaining, MAX_TIMER_DELAY_MS);
+    const timer = options.scheduler.schedule(delay, () => {
+      const current = lookup(held.slot.personaId, held.slot.eventId);
+      if (current !== held) {
+        return;
+      }
+      held.timer = null;
+      let due: boolean;
+      try {
+        due = held.slot.expiresAt <= options.now();
+      } catch {
+        // The clock failed. Leave the body in place; the next sweep can retry.
+        return;
+      }
+      if (due) {
+        held.onDue(held.slot);
+        return;
+      }
+      arm(held);
+    });
+    held.timer = timer;
+  }
+
+  return {
+    put(slot, onDue) {
+      const slots = personaMap(slot.personaId);
+      const previous = slots.get(slot.eventId);
+      previous?.timer?.cancel();
+      const held: Held = { slot, onDue, timer: null };
+      slots.set(slot.eventId, held);
+      arm(held);
+    },
+
+    peek(personaId, eventId) {
+      return lookup(personaId, eventId)?.slot ?? null;
+    },
+
+    count(personaId, source) {
+      const slots = byPersona.get(personaId);
+      if (slots === undefined) {
+        return 0;
+      }
+      let count = 0;
+      for (const held of slots.values()) {
+        if (held.slot.source === source) {
+          count += 1;
+        }
+      }
+      return count;
+    },
+
+    list(personaId) {
+      const slots = byPersona.get(personaId);
+      if (slots === undefined) {
+        return [];
+      }
+      return [...slots.values()]
+        .map((held) => held.slot)
+        .sort((left, right) => {
+          if (left.receivedAt !== right.receivedAt) {
+            return left.receivedAt < right.receivedAt ? -1 : 1;
+          }
+          if (left.eventId === right.eventId) {
+            return 0;
+          }
+          return left.eventId < right.eventId ? -1 : 1;
+        });
+    },
+
+    due(personaId, now) {
+      const slots = byPersona.get(personaId);
+      if (slots === undefined) {
+        return [];
+      }
+      const dueSlots: BufferSlot[] = [];
+      for (const held of slots.values()) {
+        if (held.slot.expiresAt <= now) {
+          dueSlots.push(held.slot);
+        }
+      }
+      return dueSlots;
+    },
+
+    dueAll(now) {
+      const dueSlots: BufferSlot[] = [];
+      for (const slots of byPersona.values()) {
+        for (const held of slots.values()) {
+          if (held.slot.expiresAt <= now) {
+            dueSlots.push(held.slot);
+          }
+        }
+      }
+      return dueSlots;
+    },
+
+    take(personaId, eventId) {
+      const slots = byPersona.get(personaId);
+      if (slots === undefined) {
+        return null;
+      }
+      const held = slots.get(eventId);
+      if (held === undefined) {
+        return null;
+      }
+      held.timer?.cancel();
+      held.timer = null;
+      slots.delete(eventId);
+      forgetPersonaIfEmpty(personaId, slots);
+      return held.slot;
+    },
+
+    rearm(personaId, eventId) {
+      const held = lookup(personaId, eventId);
+      if (held === null) {
+        return;
+      }
+      arm(held);
+    },
+
+    clear() {
+      for (const slots of byPersona.values()) {
+        for (const held of slots.values()) {
+          held.timer?.cancel();
+          held.timer = null;
+        }
+      }
+      byPersona.clear();
+    },
+  };
+}

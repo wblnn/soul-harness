@@ -561,10 +561,11 @@ describe('allocator — sqlite primary key backstop', () => {
 });
 
 describe('allocator — surface and purity', () => {
-  it('exports the allocator and the persona lifecycle, not later runtime surfaces', async () => {
+  it('exports the allocator, persona lifecycle, and P1 ingress, not later surfaces', async () => {
     const exported = new Set(Object.keys(await import('../src/index.js')));
     expect(exported.has('createRuntime')).toBe(false);
     expect(exported.has('acceptStimulus')).toBe(false);
+    expect(exported.has('createStimulusIngress')).toBe(true);
     expect(exported.has('enqueueTask')).toBe(false);
     expect(exported.has('recover')).toBe(false);
     expect(exported.has('checkpointAll')).toBe(false);
@@ -598,7 +599,8 @@ describe('allocator — surface and purity', () => {
           specifier.startsWith('.') ||
           specifier === 'node:crypto' ||
           specifier === '@soul-harness/contracts' ||
-          specifier === '@soul-harness/persistence';
+          specifier === '@soul-harness/persistence' ||
+          specifier === 'ajv';
         expect(allowed, `${file} imports ${specifier}`).toBe(true);
       }
       for (const verb of ['SELECT ', 'INSERT ', 'UPDATE ', 'DELETE ', 'PRAGMA ']) {

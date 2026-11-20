@@ -43,9 +43,11 @@ import {
   allocatePersonaId,
   allocateSessionId,
   createPersonaLifecycle,
+  createStimulusIngress,
   type PersonaLifecycle,
   type PersonaSnapshot,
   type RuntimeLogger,
+  type StimulusIngress,
 } from '@soul-harness/runtime';
 
 export const personaId: PersonaId = 'psn_01JQ8Z3K5M7P9R2T4V6X8Z0ABC' as PersonaId;
@@ -146,4 +148,21 @@ export const badBoot: PersonaLifecycle = createPersonaLifecycle({
   logger: consumerLogger,
   // @ts-expect-error bootId is a BootId, not a number
   bootId: 1,
+});
+
+// --- runtime: SH-008C publishes the in-process ingress, not HTTP or the scheduler ---
+
+export const ingress: StimulusIngress = createStimulusIngress({
+  store,
+  logger: consumerLogger,
+  config: { queueCapacity: 4, bufferTtlMs: 60_000 },
+});
+
+export const admitted = ingress.acceptStimulus({ stimulus });
+
+export const unbounded: StimulusIngress = createStimulusIngress({
+  store,
+  logger: consumerLogger,
+  // @ts-expect-error queue capacity and buffer TTL are required
+  config: {},
 });

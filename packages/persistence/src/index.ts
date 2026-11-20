@@ -60,6 +60,7 @@ export {
 export {
   createRepositories,
   createCheckpointRepository,
+  ACTIVE_SESSION_EXTERNAL_ID_MAX_LENGTH,
   createEventRepository,
   createPersonaRepository,
   createRuntimeStateRepository,
@@ -73,13 +74,19 @@ export {
 export type {
   CheckpointLoadResult,
   CheckpointRepository,
+  CloseSessionInput,
+  CommitP1EventInput,
   CommitPersonaLifecycleInput,
   CommittedPersonaLifecycle,
   EventRepository,
+  ExpireActiveEventInput,
   InsertEventInput,
   InsertPersonaInput,
   InsertSessionInput,
   InsertTaskInput,
+  OpenActiveSessionInput,
+  OpenActiveSessionResult,
+  P1CommitOutcome,
   PersonaRepository,
   Repositories,
   RuntimeStateRepository,
@@ -92,7 +99,6 @@ export type {
   UpdatePersonaStateInput,
   UpdateTaskStateInput,
   UpsertRuntimeStateInput,
-  CloseSessionInput,
 } from './repositories/index.js';
 
 export {

@@ -10,14 +10,29 @@
  *   3. `expireIfActive` addresses an event only together with `personaId`, and
  *      only while `archive_state` is still `'none'` (P1 buffer-loss). It does
  *      not implement archive recovery (scan A / scan B).
+ *   4. `commitP1Envelope` inserts `received` and moves to the P1 outcome in the
+ *      same commit. Archive columns stay at their defaults. It is not an
+ *      Archive Writer and it does not store a body.
+ *   5. `expireActive` is the same persona-scoped guard as `expireIfActive`,
+ *      with the caller naming which expired reason to write. Terminal rows and
+ *      non-`none` archive states are left untouched.
  */
 
-import { isAdapterEventRef, isEventId, isPersonaId } from '@soul-harness/contracts';
+import {
+  isAdapterEventRef,
+  isAdapterId,
+  isEventId,
+  isExpiredReason,
+  isPersonaId,
+  isSessionId,
+  isSourceId,
+} from '@soul-harness/contracts';
 import type {
   AdapterId,
   AttentionOutcome,
   EventId,
   EventStatus,
+  ExpiredReason,
   PersonaId,
   SessionId,
   SourceId,
@@ -122,6 +137,46 @@ export interface ExpireEventInput {
 }
 
 /**
+ * P1 envelope commit.
+ *
+ * `outcome` is the status that is visible after commit. The statement inserts
+ * `received` and then updates that same row before COMMIT, so a crash cannot
+ * observe the intermediate status and cannot observe `pending`. Archive
+ * columns are not in either statement.
+ */
+export type P1CommitOutcome =
+  | { readonly status: 'accepted' }
+  | { readonly status: 'expired'; readonly reason: 'queue_overflow' };
+
+export interface CommitP1EventInput {
+  readonly id: EventId;
+  readonly personaId: PersonaId;
+  readonly sessionId?: SessionId | null;
+  readonly source: SourceId;
+  readonly adapterId: AdapterId;
+  readonly adapterEventRef: string;
+  readonly receivedAt: number;
+  readonly occurredAt?: number | null;
+  readonly updatedAt: number;
+  readonly outcome: P1CommitOutcome;
+}
+
+/**
+ * Conditional close of a still-active P1 event (`archive_state = 'none'`).
+ *
+ * Same row guard as `expireIfActive`. `reason` chooses the expired code.
+ * `buffer_lost` remains available through `expireIfActive`; this method is how
+ * a live process records `ttl_expired` or `queue_overflow` without rewriting a
+ * terminal row.
+ */
+export interface ExpireActiveEventInput {
+  readonly id: EventId;
+  readonly personaId: PersonaId;
+  readonly updatedAt: number;
+  readonly reason: ExpiredReason;
+}
+
+/**
  * Rejects a scope that cannot be a persona id before any database access.
  *
  * Identifier shape uses `invalid_identifier` (same code as `adapterEventRef`).
@@ -132,6 +187,79 @@ function assertPersonaId(personaId: PersonaId): void {
   if (!isPersonaId(personaId)) {
     throw new PersistenceError('invalid_identifier', 'personaId must be a valid PersonaId', {
       details: { field: 'personaId' },
+    });
+  }
+}
+
+function assertTimestamp(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new PersistenceError('invalid_argument', `${field} must be a non-negative safe integer`, {
+      details: { field },
+    });
+  }
+}
+
+function assertCommitInput(input: CommitP1EventInput): {
+  readonly status: 'accepted' | 'expired';
+  readonly reason: StatusReason | null;
+} {
+  if (!isEventId(input.id)) {
+    throw new PersistenceError('invalid_identifier', 'event id must be a valid EventId', {
+      details: { field: 'id' },
+    });
+  }
+  assertPersonaId(input.personaId);
+  if (input.sessionId !== undefined && input.sessionId !== null && !isSessionId(input.sessionId)) {
+    throw new PersistenceError('invalid_identifier', 'sessionId must be a valid SessionId', {
+      details: { field: 'sessionId' },
+    });
+  }
+  if (!isSourceId(input.source)) {
+    throw new PersistenceError('invalid_identifier', 'source must be a valid source id', {
+      details: { field: 'source' },
+    });
+  }
+  if (!isAdapterId(input.adapterId)) {
+    throw new PersistenceError('invalid_identifier', 'adapterId must be a valid adapter id', {
+      details: { field: 'adapterId' },
+    });
+  }
+  if (!isAdapterEventRef(input.adapterEventRef)) {
+    throw new PersistenceError(
+      'invalid_identifier',
+      'adapterEventRef must match ^[A-Za-z0-9._:-]{1,64}$',
+      { details: { field: 'adapterEventRef' } },
+    );
+  }
+  assertTimestamp(input.receivedAt, 'receivedAt');
+  assertTimestamp(input.updatedAt, 'updatedAt');
+  if (input.occurredAt !== undefined && input.occurredAt !== null) {
+    assertTimestamp(input.occurredAt, 'occurredAt');
+  }
+  if (input.outcome.status === 'accepted') {
+    return { status: 'accepted', reason: null };
+  }
+  if (input.outcome.status === 'expired' && input.outcome.reason === 'queue_overflow') {
+    return { status: 'expired', reason: 'queue_overflow' };
+  }
+  throw new PersistenceError(
+    'invalid_argument',
+    'P1 commit outcome must be accepted or expired queue_overflow',
+    { details: { field: 'outcome' } },
+  );
+}
+
+function assertExpireActiveInput(input: ExpireActiveEventInput): void {
+  if (!isEventId(input.id)) {
+    throw new PersistenceError('invalid_identifier', 'event id must be a valid EventId', {
+      details: { field: 'id' },
+    });
+  }
+  assertPersonaId(input.personaId);
+  assertTimestamp(input.updatedAt, 'updatedAt');
+  if (!isExpiredReason(input.reason)) {
+    throw new PersistenceError('invalid_argument', 'reason must be an expired status reason', {
+      details: { field: 'reason' },
     });
   }
 }
@@ -355,6 +483,82 @@ export function createEventRepository(store: Store) {
                 AND archive_state = 'none'`,
           )
           .run(input.updatedAt, input.personaId, input.id).changes;
+
+        return Number(changes) === 0 ? null : selectById(tx, input.id);
+      });
+    },
+
+    /**
+     * Inserts a P1 envelope as `received` and moves it to `outcome` before commit.
+     *
+     * Archive columns are omitted, so they stay NULL / NULL / `'none'`. The
+     * body is not a parameter. A dedupe-key or primary-key conflict throws
+     * `unique_conflict` and leaves the database unchanged.
+     */
+    commitP1Envelope(input: CommitP1EventInput): EventRow {
+      const outcome = assertCommitInput(input);
+
+      return withWrite(store, (tx) => {
+        tx.prepare(
+          `INSERT INTO events
+             (id, persona_id, session_id, source, adapter_id, adapter_event_ref, status,
+              attention_outcome, salience, summary, received_at, occurred_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'received', NULL, 0, NULL, ?, ?, ?)`,
+        ).run(
+          input.id,
+          input.personaId,
+          input.sessionId ?? null,
+          input.source,
+          input.adapterId,
+          input.adapterEventRef,
+          input.receivedAt,
+          input.occurredAt ?? null,
+          input.updatedAt,
+        );
+
+        const changes = tx
+          .prepare(
+            `UPDATE events
+                SET status = ?, status_reason = ?, updated_at = ?
+              WHERE id = ? AND status = 'received' AND archive_state = 'none'`,
+          )
+          .run(outcome.status, outcome.reason, input.updatedAt, input.id).changes;
+
+        if (Number(changes) !== 1) {
+          throw new PersistenceError(
+            'db_error',
+            'P1 envelope commit did not move the inserted row',
+            { details: { operation: 'commit P1 envelope' } },
+          );
+        }
+
+        const written = selectById(tx, input.id);
+        if (written === null) {
+          throw new Error('event commit did not produce a row');
+        }
+        return written;
+      });
+    },
+
+    /**
+     * Moves a still-active P1 event to `expired` with the given reason.
+     *
+     * The guard matches `expireIfActive`: persona scope, active status, and
+     * `archive_state = 'none'`. A miss returns null and writes nothing.
+     * `attention_outcome` is not in the SET list.
+     */
+    expireActive(input: ExpireActiveEventInput): EventRow | null {
+      assertExpireActiveInput(input);
+
+      return withWrite(store, (tx) => {
+        const changes = tx
+          .prepare(
+            `UPDATE events
+                SET status = 'expired', status_reason = ?, updated_at = ?
+              WHERE persona_id = ? AND id = ? AND status IN ('received', 'accepted')
+                AND archive_state = 'none'`,
+          )
+          .run(input.reason, input.updatedAt, input.personaId, input.id).changes;
 
         return Number(changes) === 0 ? null : selectById(tx, input.id);
       });
