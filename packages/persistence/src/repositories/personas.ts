@@ -6,7 +6,7 @@
  * the caller, so it cannot be spoofed.
  */
 
-import { isPersonaId } from '@soul-harness/contracts';
+import { isBootId, isPersonaId } from '@soul-harness/contracts';
 import type { BootId, PersonaId } from '@soul-harness/contracts';
 
 import { allRows, oneRow, type StatementSource } from '../db/rows.js';
@@ -15,10 +15,17 @@ import type { Store } from '../db/store.js';
 import { PersistenceError } from '../errors.js';
 import { camelizeRow } from '../mapping.js';
 import { withWrite } from '../tx/coordinator.js';
-import type { PersonaRow, PersonaState } from '../types/rows.js';
+import {
+  PERSONA_STATES,
+  type PersonaRow,
+  type PersonaState,
+  type RuntimeStateRow,
+} from '../types/rows.js';
 import { assertLimit } from './shared.js';
 
 const COLUMNS = 'id, display_name, state, version, epoch, boot_id, created_at, updated_at';
+
+const RUNTIME_COLUMNS = 'persona_id, state, boot_id, epoch, updated_at';
 
 export interface InsertPersonaInput {
   readonly id: PersonaId;
@@ -48,6 +55,34 @@ export interface CompareAndSetPersonaStateInput {
   readonly expectedVersion: number;
   readonly nextState: PersonaState;
   readonly updatedAt: number;
+}
+
+/**
+ * Conditional lifecycle write.
+ *
+ * This is storage, not policy: the caller decides whether `expectedState` may
+ * become `nextState`. The statement only commits when both expectations still
+ * match, then mirrors the resulting persona row onto `runtime_state` in the
+ * same transaction. `epoch` is copied from the persona row; the caller cannot
+ * supply one. `checkpoint_json` is not in either statement.
+ *
+ * `bootId` omitted (or `undefined`) leaves `personas.boot_id` as it is.
+ * `bootId: null` clears it. A `BootId` replaces it. The mirrored runtime row
+ * always receives the persona's boot id after that choice.
+ */
+export interface CommitPersonaLifecycleInput {
+  readonly id: PersonaId;
+  readonly expectedState: PersonaState;
+  readonly expectedVersion: number;
+  readonly nextState: PersonaState;
+  readonly updatedAt: number;
+  readonly bootId?: BootId | null;
+}
+
+/** Persona row and the runtime row written by the same lifecycle statement. */
+export interface CommittedPersonaLifecycle {
+  readonly persona: PersonaRow;
+  readonly runtimeState: RuntimeStateRow;
 }
 
 /**
@@ -84,6 +119,98 @@ function selectById(source: StatementSource, id: PersonaId): PersonaRow | null {
     id,
   );
   return raw === undefined ? null : mapPersona(raw);
+}
+
+function mapRuntimeState(raw: Readonly<Record<string, unknown>>): RuntimeStateRow {
+  const row = camelizeRow<Record<string, unknown>>(raw);
+  return {
+    personaId: row['personaId'] as PersonaId,
+    state: row['state'] as string,
+    bootId: (row['bootId'] as BootId | null) ?? null,
+    epoch: Number(row['epoch']),
+    updatedAt: Number(row['updatedAt']),
+  };
+}
+
+function selectRuntimeState(source: StatementSource, personaId: PersonaId): RuntimeStateRow | null {
+  const raw = oneRow<Record<string, unknown>>(
+    source.prepare(`SELECT ${RUNTIME_COLUMNS} FROM runtime_state WHERE persona_id = ?`),
+    personaId,
+  );
+  return raw === undefined ? null : mapRuntimeState(raw);
+}
+
+/**
+ * Copies the persona's lifecycle columns onto `runtime_state`.
+ *
+ * `epoch` comes from the persona row that was just written, so this cannot
+ * increment it. `checkpoint_json` is absent from both the insert list and the
+ * conflict update, so an existing checkpoint survives.
+ */
+function mirrorRuntimeState(source: StatementSource, persona: PersonaRow): RuntimeStateRow {
+  source
+    .prepare(
+      `INSERT INTO runtime_state (persona_id, state, boot_id, epoch, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(persona_id) DO UPDATE SET
+         state = excluded.state,
+         boot_id = excluded.boot_id,
+         epoch = excluded.epoch,
+         updated_at = excluded.updated_at`,
+    )
+    .run(persona.id, persona.state, persona.bootId, persona.epoch, persona.updatedAt);
+
+  const mirrored = selectRuntimeState(source, persona.id);
+  // Unreachable in practice: the upsert above wrote this primary key.
+  if (mirrored === null) {
+    throw new Error('runtime_state mirror did not produce a row');
+  }
+  return mirrored;
+}
+
+function assertPersonaId(id: PersonaId): void {
+  if (!isPersonaId(id)) {
+    throw new PersistenceError('invalid_identifier', 'id must be a valid PersonaId', {
+      details: { field: 'id' },
+    });
+  }
+}
+
+function assertPersonaState(value: string, field: string): void {
+  if (!(PERSONA_STATES as readonly string[]).includes(value)) {
+    throw new PersistenceError('invalid_argument', `${field} must be a persona state`, {
+      details: { field },
+    });
+  }
+}
+
+function assertSafeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value)) {
+    throw new PersistenceError('invalid_argument', `${field} must be a safe integer`, {
+      details: { field },
+    });
+  }
+}
+
+function assertBootId(bootId: BootId | null | undefined): void {
+  if (bootId !== undefined && bootId !== null && !isBootId(bootId)) {
+    throw new PersistenceError('invalid_identifier', 'bootId must be a valid BootId', {
+      details: { field: 'bootId' },
+    });
+  }
+}
+
+function assertLifecycleInput(input: InsertPersonaInput): void {
+  assertPersonaId(input.id);
+  if (typeof input.displayName !== 'string') {
+    throw new PersistenceError('invalid_argument', 'displayName must be a string', {
+      details: { field: 'displayName' },
+    });
+  }
+  assertPersonaState(input.state, 'state');
+  assertSafeInteger(input.createdAt, 'createdAt');
+  assertSafeInteger(input.updatedAt, 'updatedAt');
+  assertBootId(input.bootId);
 }
 
 export function createPersonaRepository(store: Store) {
@@ -192,6 +319,102 @@ export function createPersonaRepository(store: Store) {
           ).changes;
 
         return Number(changes) === 0 ? null : selectById(tx, input.id);
+      });
+    },
+
+    /**
+     * Inserts the persona and its `runtime_state` row in one transaction.
+     *
+     * `version` and `epoch` stay on the table defaults (0 and 1). The runtime
+     * row copies the epoch the insert actually stored. No checkpoint is written.
+     */
+    insertWithRuntimeState(input: InsertPersonaInput): CommittedPersonaLifecycle {
+      assertLifecycleInput(input);
+      return withWrite(store, (tx) => {
+        tx.prepare(
+          `INSERT INTO personas (id, display_name, state, boot_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(
+          input.id,
+          input.displayName,
+          input.state,
+          input.bootId ?? null,
+          input.createdAt,
+          input.updatedAt,
+        );
+
+        const persona = selectById(tx, input.id);
+        // Unreachable in practice: the row was inserted in this transaction.
+        if (persona === null) {
+          throw new Error('persona insert did not produce a row');
+        }
+        return { persona, runtimeState: mirrorRuntimeState(tx, persona) };
+      });
+    },
+
+    /**
+     * Compare-and-set the persona, then mirror it onto `runtime_state`.
+     *
+     * Returns `null` when the expected state or version no longer matches.
+     * In that case neither table is modified. A match bumps `version` by exactly
+     * one and copies the stored epoch; it does not add a way to set epoch.
+     */
+    commitLifecycle(input: CommitPersonaLifecycleInput): CommittedPersonaLifecycle | null {
+      assertPersonaId(input.id);
+      assertPersonaState(input.expectedState, 'expectedState');
+      assertPersonaState(input.nextState, 'nextState');
+      assertSafeInteger(input.expectedVersion, 'expectedVersion');
+      if (input.expectedVersion < 0) {
+        throw new PersistenceError(
+          'invalid_argument',
+          'expectedVersion must be a non-negative safe integer',
+          { details: { field: 'expectedVersion' } },
+        );
+      }
+      assertSafeInteger(input.updatedAt, 'updatedAt');
+      assertBootId(input.bootId);
+
+      return withWrite(store, (tx) => {
+        const changes =
+          input.bootId === undefined
+            ? tx
+                .prepare(
+                  `UPDATE personas
+                      SET state = ?, version = version + 1, updated_at = ?
+                    WHERE id = ? AND state = ? AND version = ?`,
+                )
+                .run(
+                  input.nextState,
+                  input.updatedAt,
+                  input.id,
+                  input.expectedState,
+                  input.expectedVersion,
+                ).changes
+            : tx
+                .prepare(
+                  `UPDATE personas
+                      SET state = ?, version = version + 1, updated_at = ?, boot_id = ?
+                    WHERE id = ? AND state = ? AND version = ?`,
+                )
+                .run(
+                  input.nextState,
+                  input.updatedAt,
+                  input.bootId,
+                  input.id,
+                  input.expectedState,
+                  input.expectedVersion,
+                ).changes;
+
+        if (Number(changes) === 0) {
+          return null;
+        }
+
+        const persona = selectById(tx, input.id);
+        // Unreachable in practice: the guarded update reported a changed row.
+        if (persona === null) {
+          throw new Error('persona commit did not produce a row');
+        }
+        return { persona, runtimeState: mirrorRuntimeState(tx, persona) };
       });
     },
   };

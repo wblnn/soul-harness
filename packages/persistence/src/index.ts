@@ -73,6 +73,8 @@ export {
 export type {
   CheckpointLoadResult,
   CheckpointRepository,
+  CommitPersonaLifecycleInput,
+  CommittedPersonaLifecycle,
   EventRepository,
   InsertEventInput,
   InsertPersonaInput,

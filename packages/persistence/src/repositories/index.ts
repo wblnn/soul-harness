@@ -24,7 +24,13 @@ export type {
 } from './checkpoint.js';
 
 export { createPersonaRepository } from './personas.js';
-export type { InsertPersonaInput, PersonaRepository, UpdatePersonaStateInput } from './personas.js';
+export type {
+  CommitPersonaLifecycleInput,
+  CommittedPersonaLifecycle,
+  InsertPersonaInput,
+  PersonaRepository,
+  UpdatePersonaStateInput,
+} from './personas.js';
 
 export { createSessionRepository } from './sessions.js';
 export type { CloseSessionInput, InsertSessionInput, SessionRepository } from './sessions.js';

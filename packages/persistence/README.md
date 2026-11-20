@@ -47,7 +47,7 @@ packages/persistence/
 │  ├─ migrations/{types,expected-schema,load,migrator}.ts
 │  ├─ repositories/{personas,sessions,events,tasks,runtime-state,checkpoint,schema-migrations,shared,index}.ts
 │  └─ types/rows.ts                # camelCase 行类型（复用 contracts 品牌 ID）
-└─ test/                           # 210 项，真实 SQLite 文件
+└─ test/                           # 281 项，真实 SQLite 文件
 ```
 
 ## 4. 依赖
@@ -116,7 +116,7 @@ withRead(store, (tx) => T): T
 
 | 表 | 方法 |
 |---|---|
-| `personas` | `insert` / `getById` / `updateState`（版本自增）/ `compareAndSetState`（条件写）/ `list(limit)` / `listPage`（键集分页） |
+| `personas` | `insert` / `insertWithRuntimeState` / `getById` / `updateState`（版本自增）/ `compareAndSetState`（条件写）/ `commitLifecycle`（条件写并镜像 `runtime_state`）/ `list(limit)` / `listPage`（键集分页） |
 | `sessions` | `insert` / `getById` / `findActiveByExternal` / `close` / `listByPersona` |
 | `events` | `insert`（archive 三列不可设；`summary` 只接受 NULL；`adapterEventRef` 强制格式）/ `getById` / `findByDedupeKey` / `updateStatus` / `expireIfActive`（条件写）/ `listByPersonaStatus` / `listPageByPersonaStatus`（键集分页） |
 | `tasks` | `insert` / `getById` / `updateState` / `listByPersonaState` |
@@ -205,6 +205,19 @@ const stored = checkpoints.save({ personaId, epoch, refs?, updatedAt });
 - `expireIfActive` 的 `SET` 子句不含 `status_reason` 之外的字段，`attention_outcome` 保持原值；
   终态 `acted` / `rejected` / `expired` 永远不会被它命中；
 - `version` 严格自增是持久化不变式：CAS 以 `version` 为令牌，若允许写入后版本不变会引入 ABA。
+
+### 7.3 人格行与 `runtime_state` 同事务写入（SH-008B）
+
+`compareAndSetState` 仍然只改 `personas`，不写 `boot_id`，也不碰 `runtime_state`。生命周期需要「状态、版本、boot id、runtime 行」一次落地，因此新增两个方法。它们不判断转移是否合法，也不接受调用方传入的 `epoch`。
+
+| 方法 | 语义 |
+|---|---|
+| `insertWithRuntimeState(input)` | 同一事务插入 `personas` 与 `runtime_state`。`version` / `epoch` 用表默认值（0 / 1）。不写检查点 |
+| `commitLifecycle({ id, expectedState, expectedVersion, nextState, updatedAt, bootId? })` | 条件写。命中则 `version` 严格 +1，并把结果行镜像到 `runtime_state`。未命中返回 `null`，两表都不变 |
+
+`bootId` 省略时保留 `personas.boot_id`；传入 `null` 则清空；传入合法 `BootId` 则覆盖。镜像行的 `boot_id` 与 `epoch` 取自刚写完的人格行，因此 epoch 不会在这里被增加。两条语句都不包含 `checkpoint_json`，已有检查点保持原样。
+
+参数在打开事务之前校验：非法 `PersonaId`、`BootId`、状态名或非安全整数 → `invalid_identifier` / `invalid_argument`，库不变。
 
 ## 8. Migration 机制
 
