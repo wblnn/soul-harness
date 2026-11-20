@@ -1,15 +1,18 @@
 /**
  * events repository.
  *
- * Two invariants are encoded structurally:
+ * Invariants encoded structurally:
  *   1. `insert` cannot set any archive column. In P1 there is no Archive Writer,
  *      so `archive_ref` / `archive_disposition` must stay NULL and
  *      `archive_state` must stay 'none' (DATA-MODEL §2.1, PLAN §6.3).
  *   2. The dedupe key lookup uses the unique index
  *      `(persona_id, adapter_id, source, adapter_event_ref)` rather than a scan.
+ *   3. `expireIfActive` addresses an event only together with `personaId`, and
+ *      only while `archive_state` is still `'none'` (P1 buffer-loss). It does
+ *      not implement archive recovery (scan A / scan B).
  */
 
-import { isAdapterEventRef, isEventId } from '@soul-harness/contracts';
+import { isAdapterEventRef, isEventId, isPersonaId } from '@soul-harness/contracts';
 import type {
   AdapterId,
   AttentionOutcome,
@@ -106,10 +109,31 @@ export interface UpdateEventStatusInput {
   readonly updatedAt: number;
 }
 
-/** Requests the only conditional terminal transition recovery is allowed to make. */
+/**
+ * P1 buffer-loss recovery only (`archive_state = 'none'`).
+ *
+ * `personaId` is required scope, not an optional filter (IDENTITY-PROTOCOL §1
+ * rule 5). This input does not describe archive recovery (scan A / scan B).
+ */
 export interface ExpireEventInput {
   readonly id: EventId;
+  readonly personaId: PersonaId;
   readonly updatedAt: number;
+}
+
+/**
+ * Rejects a scope that cannot be a persona id before any database access.
+ *
+ * Identifier shape uses `invalid_identifier` (same code as `adapterEventRef`).
+ * Pagination cursors stay on `invalid_argument`. JavaScript callers bypass the
+ * brand, so the check runs before the write transaction opens.
+ */
+function assertPersonaId(personaId: PersonaId): void {
+  if (!isPersonaId(personaId)) {
+    throw new PersistenceError('invalid_identifier', 'personaId must be a valid PersonaId', {
+      details: { field: 'personaId' },
+    });
+  }
 }
 
 /**
@@ -305,23 +329,32 @@ export function createEventRepository(store: Store) {
     },
 
     /**
-     * Atomically moves an event to `expired`/`buffer_lost`, but only while it is
-     * still `received` or `accepted`.
+     * Atomically moves a P1 buffer-loss event to `expired` / `buffer_lost`.
      *
-     * The guard is part of the same UPDATE, so it cannot be raced: terminal rows
-     * (`acted` / `rejected` / `expired`) are never rewritten, and a losing race
-     * returns `null` having touched nothing — including `status_reason` and
-     * `attention_outcome`, which are deliberately not in the SET list.
+     * Strictly that recovery. The WHERE clause requires all of: `persona_id`
+     * (IDENTITY-PROTOCOL §1 rule 5 — persona data is never addressed by id
+     * alone), `status IN ('received', 'accepted')`, and `archive_state = 'none'`.
+     *
+     * It does not handle archive recovery. Scan A (`archive_state = 'pending'`)
+     * and scan B (`archive_state = 'failed'`, and any other non-`'none'` state)
+     * need their archive state reconciled; this UPDATE will not touch them.
+     *
+     * The guard is part of the same UPDATE, so it cannot be raced. A miss
+     * returns `null` having written nothing. `attention_outcome` is not in the
+     * SET list and stays as it was.
      */
     expireIfActive(input: ExpireEventInput): EventRow | null {
+      assertPersonaId(input.personaId);
+
       return withWrite(store, (tx) => {
         const changes = tx
           .prepare(
             `UPDATE events
                 SET status = 'expired', status_reason = 'buffer_lost', updated_at = ?
-              WHERE id = ? AND status IN ('received', 'accepted')`,
+              WHERE persona_id = ? AND id = ? AND status IN ('received', 'accepted')
+                AND archive_state = 'none'`,
           )
-          .run(input.updatedAt, input.id).changes;
+          .run(input.updatedAt, input.personaId, input.id).changes;
 
         return Number(changes) === 0 ? null : selectById(tx, input.id);
       });
