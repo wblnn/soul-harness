@@ -180,6 +180,7 @@ function ingress(
     readonly randomBytes?: (size: number) => Uint8Array;
     readonly beforePersist?: (view: IngressPersistView) => void | Promise<void>;
     readonly duringRead?: () => void;
+    readonly beforeExpire?: () => void;
     readonly logger?: RuntimeLogger;
     readonly timers?: IngressScheduler;
     readonly now?: () => number;
@@ -194,6 +195,7 @@ function ingress(
     ...(extra.randomBytes === undefined ? {} : { randomBytes: extra.randomBytes }),
     ...(extra.beforePersist === undefined ? {} : { beforePersist: extra.beforePersist }),
     ...(extra.duringRead === undefined ? {} : { duringRead: extra.duringRead }),
+    ...(extra.beforeExpire === undefined ? {} : { beforeExpire: extra.beforeExpire }),
   });
 }
 
@@ -220,6 +222,13 @@ function dump(store: Store): string {
   return withRead(store, (tx) =>
     TABLES.map((table) => JSON.stringify(tx.prepare(`SELECT * FROM ${table}`).all())).join('\n'),
   );
+}
+
+function eventOf(result: { readonly eventId: EventId | null }): EventId {
+  if (result.eventId === null) {
+    throw new Error('expected an event id');
+  }
+  return result.eventId;
 }
 
 function promiseOf(run: () => Promise<unknown>): Promise<unknown> {
@@ -273,7 +282,7 @@ describe('ingress — schema and clock', () => {
       sessionId: null,
     });
     expect(isEventId(result.eventId)).toBe(true);
-    const row = createRepositories(fixture.store).events.getById(result.eventId);
+    const row = createRepositories(fixture.store).events.getById(eventOf(result));
     expect(row).toMatchObject({
       status: 'accepted',
       statusReason: null,
@@ -303,7 +312,7 @@ describe('ingress — schema and clock', () => {
     );
 
     expect(result).toMatchObject({ outcome: 'accepted', receivedAt: 9_000_000, occurredAt: 10 });
-    expect(createRepositories(fixture.store).events.getById(result.eventId)).toMatchObject({
+    expect(createRepositories(fixture.store).events.getById(eventOf(result))).toMatchObject({
       occurredAt: 10,
       receivedAt: 9_000_000,
     });
@@ -387,8 +396,8 @@ describe('ingress — dedupe without a body comparison', () => {
         status: 'accepted',
       }),
     ).toHaveLength(1);
-    expect(bus.readBuffered(id, first.eventId)?.payload).toMatchObject({ text: 'first-body' });
-    expect(JSON.stringify(bus.readBuffered(id, first.eventId))).not.toContain(OTHER_BODY);
+    expect(bus.readBuffered(id, eventOf(first))?.payload).toMatchObject({ text: 'first-body' });
+    expect(JSON.stringify(bus.readBuffered(id, eventOf(first)))).not.toContain(OTHER_BODY);
     const logged = JSON.stringify(fixture.logs);
     expect(logged).toContain('ingress.dedupe_unverifiable');
     expect(logged).toContain('"bodyVerified":false');
@@ -817,8 +826,8 @@ describe('ingress — buffer, capacity, and ttl', () => {
 
     fixture.time = 50;
     fixture.scheduler.timers[0]?.fire();
-    await waitFor(() => bus.readBuffered(id, accepted.eventId) === null);
-    expect(createRepositories(fixture.store).events.getById(accepted.eventId)?.statusReason).toBe(
+    await waitFor(() => bus.readBuffered(id, eventOf(accepted)) === null);
+    expect(createRepositories(fixture.store).events.getById(eventOf(accepted))?.statusReason).toBe(
       'ttl_expired',
     );
 
@@ -827,7 +836,7 @@ describe('ingress — buffer, capacity, and ttl', () => {
     bus.close();
     expect(fixture.scheduler.active()).toBe(0);
     fixture.scheduler.timers.at(-1)?.fire();
-    expect(createRepositories(fixture.store).events.getById(again.eventId)?.status).toBe(
+    expect(createRepositories(fixture.store).events.getById(eventOf(again))?.status).toBe(
       'accepted',
     );
     await expect(bus.acceptStimulus(envelope(id, 'mc-after-close'))).rejects.toMatchObject({
@@ -955,7 +964,7 @@ describe('ingress — isolation and robustness', () => {
     const loud = ingress(fixture, { logger: throwingLogger('info') });
     const accepted = await loud.acceptStimulus(envelope(id, 'mc-log'));
     expect(accepted.outcome).toBe('accepted');
-    expect(createRepositories(fixture.store).events.getById(accepted.eventId)?.status).toBe(
+    expect(createRepositories(fixture.store).events.getById(eventOf(accepted))?.status).toBe(
       'accepted',
     );
 
@@ -1007,6 +1016,244 @@ describe('ingress — isolation and robustness', () => {
     );
     expect(source.includes('archive.compare')).toBe(false);
     expect(source.includes("archive_state = 'pending'")).toBe(false);
+  });
+});
+
+describe('ingress — admission bounds and snapshot', () => {
+  it('refuses further accepts before enqueue while one admission is still running', async () => {
+    const fixture = openFixture();
+    const id = persona(30);
+    seedPersona(fixture.store, id);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = 0;
+    const bus = ingress(fixture, {
+      config: { queueCapacity: 1, bufferTtlMs: 60_000 },
+      beforePersist: () => {
+        entered += 1;
+        return gate;
+      },
+    });
+    const first = bus.acceptStimulus(envelope(id, 'mc-hold'));
+    await waitFor(() => entered === 1);
+
+    const flood = await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        bus.acceptStimulus({
+          stimulus: {
+            ...(envelope(id, `mc-flood-${index}`).stimulus as object),
+            payload: { kind: 'mc.world', version: 1, text: `${CANARY}-flood-${index}` },
+          },
+        }),
+      ),
+    );
+
+    expect(entered).toBe(1);
+    expect(flood).toHaveLength(40);
+    expect(flood.every((result) => result.outcome === 'backpressure')).toBe(true);
+    expect(
+      createRepositories(fixture.store).events.listByPersonaStatus({
+        personaId: id,
+        status: 'accepted',
+      }),
+    ).toEqual([]);
+    expect(dump(fixture.store).includes(`${CANARY}-flood`)).toBe(false);
+
+    release();
+    const held = await first;
+    expect(held.outcome).toBe('accepted');
+    expect(
+      createRepositories(fixture.store).events.listByPersonaStatus({
+        personaId: id,
+        status: 'accepted',
+      }),
+    ).toHaveLength(1);
+    expect(dump(fixture.store).includes(`${CANARY}-flood`)).toBe(false);
+  });
+
+  it('returns null from readBuffered once the clock passes TTL even if the timer has not fired', async () => {
+    const fixture = openFixture();
+    const id = persona(31);
+    seedPersona(fixture.store, id);
+    fixture.time = 1_000;
+    const bus = ingress(fixture, { config: { queueCapacity: 2, bufferTtlMs: 100 } });
+    const accepted = await bus.acceptStimulus({
+      stimulus: {
+        ...(envelope(id, 'mc-late-read').stimulus as object),
+        payload: { kind: 'mc.world', version: 1, text: CANARY },
+      },
+    });
+    if (accepted.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(bus.readBuffered(id, accepted.eventId)?.payload).toMatchObject({ text: CANARY });
+    expect(fixture.scheduler.timers.some((timer) => !timer.fired && !timer.cancelled)).toBe(true);
+
+    fixture.time = 1_100;
+    expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+    expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+    expect(dump(fixture.store)).not.toContain(CANARY);
+  });
+
+  it('drops the body when the TTL database update fails and retries the metadata later', async () => {
+    const fixture = openFixture();
+    const id = persona(32);
+    seedPersona(fixture.store, id);
+    fixture.time = 2_000;
+    let failures = 1;
+    const bus = ingress(fixture, {
+      config: { queueCapacity: 2, bufferTtlMs: 50 },
+      beforeExpire: () => {
+        if (failures > 0) {
+          failures -= 1;
+          throw new Error('sqlite-down');
+        }
+      },
+    });
+    const accepted = await bus.acceptStimulus({
+      stimulus: {
+        ...(envelope(id, 'mc-db-down').stimulus as object),
+        payload: { kind: 'mc.world', version: 1, text: CANARY },
+      },
+    });
+    if (accepted.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    fixture.time = 2_050;
+    expect(await bus.evictExpired()).toEqual([]);
+    expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+    expect(JSON.stringify(fixture.logs)).toContain('ingress.ttl_persist_failed');
+    expect(dump(fixture.store)).not.toContain(CANARY);
+    expect(createRepositories(fixture.store).events.getById(accepted.eventId)).toMatchObject({
+      status: 'accepted',
+      statusReason: null,
+    });
+
+    const repaired = await bus.evictExpired();
+    expect(repaired).toEqual([{ eventId: accepted.eventId, personaId: id, reason: 'ttl_expired' }]);
+    expect(createRepositories(fixture.store).events.getById(accepted.eventId)).toMatchObject({
+      status: 'expired',
+      statusReason: 'ttl_expired',
+    });
+    expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+  });
+
+  it('does not keep a body when the scheduler refuses to register a timer', async () => {
+    const fixture = openFixture();
+    const id = persona(33);
+    seedPersona(fixture.store, id);
+    const bus = ingress(fixture, {
+      timers: {
+        schedule() {
+          throw new Error('schedule-failed');
+        },
+      },
+    });
+    const accepted = await bus.acceptStimulus({
+      stimulus: {
+        ...(envelope(id, 'mc-no-timer').stimulus as object),
+        payload: { kind: 'mc.world', version: 1, text: CANARY },
+      },
+    });
+    expect(accepted.outcome).toBe('accepted');
+    if (accepted.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(bus.readBuffered(id, accepted.eventId)).toBeNull();
+    expect(bus.listQueued(id)).toEqual([]);
+    expect(JSON.stringify(fixture.logs)).toContain('ingress.buffer_failed');
+    expect(dump(fixture.store)).not.toContain(CANARY);
+    expect(createRepositories(fixture.store).events.getById(accepted.eventId)?.status).toBe(
+      'accepted',
+    );
+  });
+
+  it('keeps the validated snapshot after the caller mutates the original object', async () => {
+    const fixture = openFixture();
+    const id = persona(34);
+    const other = persona(35);
+    seedPersona(fixture.store, id);
+    seedPersona(fixture.store, other, 'Other');
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    const bus = ingress(fixture, {
+      config: { queueCapacity: 2, bufferTtlMs: 60_000 },
+      beforePersist: () => {
+        entered = true;
+        return gate;
+      },
+    });
+    const payload = { kind: 'mc.world', version: 1, text: CANARY };
+    const stimulus: Record<string, unknown> = {
+      schema: STIMULUS_INPUT_VERSION,
+      personaId: id,
+      adapterId: 'minecraft',
+      source: 'minecraft.chat',
+      adapterEventRef: 'mc-snap',
+      requestNonce: 'NQ7xK2mR9tVb4Wc8',
+      payload,
+    };
+    const pending = bus.acceptStimulus({ stimulus });
+    await waitFor(() => entered);
+    stimulus['personaId'] = other;
+    payload.text = 'tampered-body';
+    release();
+    const result = await pending;
+
+    expect(result).toMatchObject({ outcome: 'accepted', eventId: expect.any(String) });
+    if (result.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(createRepositories(fixture.store).events.getById(result.eventId)).toMatchObject({
+      personaId: id,
+      adapterEventRef: 'mc-snap',
+    });
+    expect(
+      createRepositories(fixture.store).events.listByPersonaStatus({
+        personaId: other,
+        status: 'accepted',
+      }),
+    ).toEqual([]);
+    expect(bus.readBuffered(id, result.eventId)?.payload).toMatchObject({ text: CANARY });
+    expect(dump(fixture.store)).not.toContain('tampered-body');
+  });
+
+  it('stamps receivedAt at the gate, not when a delayed admission finally runs', async () => {
+    const fixture = openFixture();
+    const id = persona(36);
+    seedPersona(fixture.store, id);
+    fixture.time = 1_000;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    const bus = ingress(fixture, {
+      config: { queueCapacity: 2, bufferTtlMs: 50_000_000 },
+      beforePersist: () => {
+        entered = true;
+        return gate;
+      },
+    });
+    const pending = bus.acceptStimulus(envelope(id, 'mc-stamp'));
+    await waitFor(() => entered);
+    fixture.time = 9_000_000;
+    release();
+    const result = await pending;
+
+    expect(result).toMatchObject({ outcome: 'accepted', receivedAt: 1_000 });
+    if (result.outcome !== 'accepted') {
+      throw new Error('expected accepted');
+    }
+    expect(createRepositories(fixture.store).events.getById(result.eventId)).toMatchObject({
+      receivedAt: 1_000,
+      status: 'accepted',
+    });
   });
 });
 

@@ -8,6 +8,9 @@
  * Timers are cancellable. `clear` drops every body and every handle. A long
  * TTL is sliced so a single timer delay stays inside the platform range, and
  * the slice reschedules until `expiresAt`.
+ *
+ * `put` and `rearm` do not leave a body behind when `schedule` throws. The
+ * slot is removed before the error leaves this module.
  */
 
 import type { EventId, PersonaId, SourceId, StimulusPayload } from '@soul-harness/contracts';
@@ -126,7 +129,17 @@ export function createPerceptionBuffer(options: {
       previous?.timer?.cancel();
       const held: Held = { slot, onDue, timer: null };
       slots.set(slot.eventId, held);
-      arm(held);
+      try {
+        arm(held);
+      } catch (error) {
+        if (slots.get(slot.eventId) === held) {
+          held.timer?.cancel();
+          held.timer = null;
+          slots.delete(slot.eventId);
+          forgetPersonaIfEmpty(slot.personaId, slots);
+        }
+        throw error;
+      }
     },
 
     peek(personaId, eventId) {
@@ -212,7 +225,18 @@ export function createPerceptionBuffer(options: {
       if (held === null) {
         return;
       }
-      arm(held);
+      try {
+        arm(held);
+      } catch (error) {
+        const slots = byPersona.get(personaId);
+        if (slots?.get(eventId) === held) {
+          held.timer?.cancel();
+          held.timer = null;
+          slots.delete(eventId);
+          forgetPersonaIfEmpty(personaId, slots);
+        }
+        throw error;
+      }
     },
 
     clear() {

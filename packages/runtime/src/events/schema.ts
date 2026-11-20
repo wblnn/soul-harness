@@ -38,14 +38,28 @@ function matches(validate: ValidateFunction, value: unknown): boolean {
   return ok;
 }
 
-/** Accepts only a document that is a closed `soul.stimulus.input.v1` envelope. */
+/**
+ * Accepts only a document that is a closed `soul.stimulus.input.v1` envelope.
+ *
+ * The returned value is a deep copy. Later writes to the caller's object do
+ * not change the persona, the dedupe key, or the payload that will be queued.
+ */
 export function parseStimulusInput(value: unknown): StimulusInputV1 {
   if (!matches(validateInput, value)) {
     throw new RuntimeError('schema_invalid', 'stimulus failed schema validation', {
       details: { schema: STIMULUS_INPUT_VERSION },
     });
   }
-  return value as StimulusInputV1;
+  let cloned: unknown;
+  try {
+    cloned = structuredClone(value);
+  } catch (error) {
+    throw new RuntimeError('schema_invalid', 'stimulus could not be snapshotted', {
+      cause: error,
+      details: { schema: STIMULUS_INPUT_VERSION },
+    });
+  }
+  return cloned as StimulusInputV1;
 }
 
 /**
@@ -83,5 +97,23 @@ export function normalizeStimulus(input: StimulusInputV1, receivedAt: number): S
       details: { schema: STIMULUS_VERSION },
     });
   }
+  freezeDeep(normalized);
   return normalized;
+}
+
+/** Freeze the snapshot so a queued envelope cannot be edited in place. */
+function freezeDeep(value: unknown): void {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) {
+    return;
+  }
+  Object.freeze(value);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      freezeDeep(item);
+    }
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    freezeDeep((value as Record<string, unknown>)[key]);
+  }
 }

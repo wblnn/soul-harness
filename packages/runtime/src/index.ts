@@ -58,6 +58,7 @@ export type {
   AcceptStimulusInput,
   BufferedStimulus,
   IngressAccepted,
+  IngressBackpressure,
   IngressChannelLimits,
   IngressDuplicate,
   IngressMetrics,
