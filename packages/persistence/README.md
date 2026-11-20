@@ -47,7 +47,7 @@ packages/persistence/
 │  ├─ migrations/{types,expected-schema,load,migrator}.ts
 │  ├─ repositories/{personas,sessions,events,tasks,runtime-state,checkpoint,schema-migrations,shared,index}.ts
 │  └─ types/rows.ts                # camelCase 行类型（复用 contracts 品牌 ID）
-└─ test/                           # 210 项，真实 SQLite 文件
+└─ test/                           # 284 项，真实 SQLite 文件
 ```
 
 ## 4. 依赖
@@ -118,7 +118,7 @@ withRead(store, (tx) => T): T
 |---|---|
 | `personas` | `insert` / `getById` / `updateState`（版本自增）/ `compareAndSetState`（条件写）/ `list(limit)` / `listPage`（键集分页） |
 | `sessions` | `insert` / `getById` / `findActiveByExternal` / `close` / `listByPersona` |
-| `events` | `insert`（archive 三列不可设；`summary` 只接受 NULL；`adapterEventRef` 强制格式）/ `getById` / `findByDedupeKey` / `updateStatus` / `expireIfActive`（条件写）/ `listByPersonaStatus` / `listPageByPersonaStatus`（键集分页） |
+| `events` | `insert`（archive 三列不可设；`summary` 只接受 NULL；`adapterEventRef` 强制格式）/ `getById` / `findByDedupeKey` / `updateStatus` / `expireIfActive`（条件写：必须带 `personaId`，且仅 P1 `archive_state='none'`）/ `listByPersonaStatus` / `listPageByPersonaStatus`（键集分页） |
 | `tasks` | `insert` / `getById` / `updateState` / `listByPersonaState` |
 | `runtime_state` | `upsert`（不触碰 checkpoint）/ `get` |
 | `checkpoints` | `load` / `save`（见 §7.1；**无 clear**） |
@@ -186,7 +186,7 @@ const stored = checkpoints.save({ personaId, epoch, refs?, updatedAt });
 | `personas.listPage({ afterId?, limit? })` | 按主键 `id` 升序的键集分页 |
 | `events.listPageByPersonaStatus({ personaId, status, afterId?, limit? })` | 同上，先按 `persona_id` + `status` 过滤 |
 | `personas.compareAndSetState({ id, expectedState, expectedVersion, nextState, updatedAt })` | 条件写；`version` 由语句自增（INV-V） |
-| `events.expireIfActive({ id, updatedAt })` | 条件写：仅 `received`/`accepted` → `expired` + `buffer_lost` |
+| `events.expireIfActive({ id, personaId, updatedAt })` | 条件写，**仅** P1 缓冲丢失恢复：同一 `personaId` 下，`received`/`accepted` 且 `archive_state = 'none'` → `expired` + `buffer_lost`。不处理归档恢复（扫描 A / 扫描 B） |
 
 **分页约定**
 
@@ -202,8 +202,17 @@ const stored = checkpoints.save({ personaId, epoch, refs?, updatedAt });
 
 - 守卫写在同一条 `UPDATE` 的 `WHERE` 中，不存在"先读后写"的竞态；
 - 条件不匹配返回 `null`，**未修改任何字段**；
-- `expireIfActive` 的 `SET` 子句不含 `status_reason` 之外的字段，`attention_outcome` 保持原值；
-  终态 `acted` / `rejected` / `expired` 永远不会被它命中；
+- `expireIfActive` **严格限于 P1 缓冲丢失恢复**（`archive_state = 'none'`），不处理归档恢复。
+  同一条 `UPDATE` 的 `WHERE` 为
+  `persona_id = ? AND id = ? AND status IN ('received', 'accepted') AND archive_state = 'none'`：
+  - 按 ID 访问事件必须同时带 `personaId`（IDENTITY-PROTOCOL §1 第 5 条）。用人格 A 的 `personaId`
+    过期人格 B 的 `eventId` 不会改任何列；`personaId` 在开事务前按 `isPersonaId` 校验，非法值
+    → `invalid_identifier`（与 `adapterEventRef` 同一错误码；分页游标仍是 `invalid_argument`）；
+  - `archive_state` 不是 `'none'` 的行（`pending` / `archived` / `failed` / `excluded`）一律不改。
+    扫描 A（对象是 `pending`）和扫描 B（对象是 `failed` 等）要先对账归档状态；本方法不代替它们，
+    也不会把这些行静默标成 `expired`；
+  - `SET` 只写 `status`、`status_reason = 'buffer_lost'`、`updated_at`。`attention_outcome` 保持原值。
+    终态 `acted` / `rejected` / `expired` 不会被命中；
 - `version` 严格自增是持久化不变式：CAS 以 `version` 为令牌，若允许写入后版本不变会引入 ABA。
 
 ## 8. Migration 机制

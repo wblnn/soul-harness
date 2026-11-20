@@ -11,6 +11,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AdapterId, EventId, PersonaId, SourceId } from '@soul-harness/contracts';
 
+import { databaseOf } from '../src/db/store.js';
+import { PersistenceError } from '../src/errors.js';
 import { createRepositories } from '../src/index.js';
 import { closeAll, NOW, openMigratedStore } from './helpers/fixture.js';
 
@@ -18,6 +20,7 @@ afterEach(closeAll);
 
 const BODY = '01JQ8Z3K5M7P9R2T4V6X8Z';
 const PERSONA = `psn_${BODY}0010` as PersonaId;
+const PERSONA_B = `psn_${BODY}0020` as PersonaId;
 const EVENT_1 = `evt_${BODY}0010` as EventId;
 const EVENT_2 = `evt_${BODY}0020` as EventId;
 const EVENT_3 = `evt_${BODY}0030` as EventId;
@@ -42,10 +45,11 @@ function insertEvent(
   ref: string,
   status: 'received' | 'accepted' | 'acted',
   attentionOutcome: 'not_evaluated' | 'queued' | 'fully_aware' | null,
+  personaId: PersonaId = PERSONA,
 ) {
   return repos.events.insert({
     id,
-    personaId: PERSONA,
+    personaId,
     source: SOURCE,
     adapterId: ADAPTER,
     adapterEventRef: ref,
@@ -54,6 +58,15 @@ function insertEvent(
     receivedAt: NOW,
     updatedAt: NOW,
   });
+}
+
+function codeOf(run: () => unknown): string {
+  try {
+    run();
+    return 'no-throw';
+  } catch (error) {
+    return error instanceof PersistenceError ? error.code : 'not-a-persistence-error';
+  }
 }
 
 describe('personas.compareAndSetState', () => {
@@ -126,7 +139,11 @@ describe('events.expireIfActive', () => {
     const { repos } = seedPersona(store);
     const event = insertEvent(repos, EVENT_1, 'ref-received', 'received', 'queued');
 
-    const result = repos.events.expireIfActive({ id: EVENT_1, updatedAt: NOW + 10 });
+    const result = repos.events.expireIfActive({
+      id: EVENT_1,
+      personaId: PERSONA,
+      updatedAt: NOW + 10,
+    });
 
     expect(result).toMatchObject({
       status: 'expired',
@@ -147,7 +164,11 @@ describe('events.expireIfActive', () => {
     const { repos } = seedPersona(store);
     insertEvent(repos, EVENT_2, 'ref-accepted', 'accepted', null);
 
-    const result = repos.events.expireIfActive({ id: EVENT_2, updatedAt: NOW + 20 });
+    const result = repos.events.expireIfActive({
+      id: EVENT_2,
+      personaId: PERSONA,
+      updatedAt: NOW + 20,
+    });
 
     expect(result?.status).toBe('expired');
     const stored = repos.events.getById(EVENT_2);
@@ -187,7 +208,13 @@ describe('events.expireIfActive', () => {
       expect(row).not.toBeNull();
       const before = row as NonNullable<typeof row>;
 
-      expect(repos.events.expireIfActive({ id: before.id, updatedAt: NOW + 999 })).toBeNull();
+      expect(
+        repos.events.expireIfActive({
+          id: before.id,
+          personaId: PERSONA,
+          updatedAt: NOW + 999,
+        }),
+      ).toBeNull();
 
       const after = repos.events.getById(before.id);
       expect(after?.status).toBe(before.status);
@@ -198,6 +225,105 @@ describe('events.expireIfActive', () => {
       expect(after?.archiveState).toBe(before.archiveState);
     }
   });
+
+  it("B7 does not modify another persona's event", () => {
+    const store = openMigratedStore();
+    const { repos } = seedPersona(store);
+    repos.personas.insert({
+      id: PERSONA_B,
+      displayName: 'Other',
+      state: 'STARTING',
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+    const ownedByB = insertEvent(repos, EVENT_1, 'ref-b', 'received', 'queued', PERSONA_B);
+
+    // Persona A's scope must not reach Persona B's row, even though the id
+    // exists and the row is otherwise eligible (received, archive_state none).
+    expect(
+      repos.events.expireIfActive({ id: EVENT_1, personaId: PERSONA, updatedAt: NOW + 40 }),
+    ).toBeNull();
+
+    expect(repos.events.getById(EVENT_1)).toMatchObject({
+      id: ownedByB.id,
+      personaId: PERSONA_B,
+      status: 'received',
+      statusReason: null,
+      attentionOutcome: 'queued',
+      updatedAt: NOW,
+      archiveState: 'none',
+      salience: ownedByB.salience,
+    });
+
+    // Control: the same row expires once the scope matches, so the miss above
+    // was the persona guard and not an ineligible status.
+    expect(
+      repos.events.expireIfActive({ id: EVENT_1, personaId: PERSONA_B, updatedAt: NOW + 41 }),
+    ).toMatchObject({
+      personaId: PERSONA_B,
+      status: 'expired',
+      statusReason: 'buffer_lost',
+      attentionOutcome: 'queued',
+      updatedAt: NOW + 41,
+    });
+  });
+
+  it.each([
+    ['pending', 'received'],
+    ['archived', 'accepted'],
+    ['failed', 'received'],
+    ['excluded', 'accepted'],
+  ] as const)(
+    'B8 does not expire archive_state %s while status is still %s',
+    (archiveState, status) => {
+      const store = openMigratedStore();
+      const { repos } = seedPersona(store);
+      const before = insertEvent(repos, EVENT_1, `ref-${archiveState}`, status, 'queued');
+      const written = databaseOf(store)
+        .prepare('UPDATE events SET archive_state = ? WHERE id = ?')
+        .run(archiveState, EVENT_1);
+      expect(Number(written.changes)).toBe(1);
+
+      expect(
+        repos.events.expireIfActive({ id: EVENT_1, personaId: PERSONA, updatedAt: NOW + 80 }),
+      ).toBeNull();
+
+      expect(repos.events.getById(EVENT_1)).toMatchObject({
+        status: before.status,
+        statusReason: before.statusReason,
+        attentionOutcome: 'queued',
+        updatedAt: before.updatedAt,
+        archiveState,
+        salience: before.salience,
+      });
+    },
+  );
+
+  it('B9 rejects a personaId that is not a persona id before writing', () => {
+    const store = openMigratedStore();
+    const { repos } = seedPersona(store);
+    insertEvent(repos, EVENT_1, 'ref-bad-scope', 'received', 'queued');
+
+    for (const personaId of ['', 'not-a-persona', EVENT_1]) {
+      expect(
+        codeOf(() =>
+          repos.events.expireIfActive({
+            id: EVENT_1,
+            personaId: personaId as PersonaId,
+            updatedAt: NOW + 3,
+          }),
+        ),
+      ).toBe('invalid_identifier');
+    }
+
+    expect(repos.events.getById(EVENT_1)).toMatchObject({
+      status: 'received',
+      statusReason: null,
+      attentionOutcome: 'queued',
+      updatedAt: NOW,
+      archiveState: 'none',
+    });
+  });
 });
 
 describe('conditional update SQL contract', () => {
@@ -205,7 +331,7 @@ describe('conditional update SQL contract', () => {
     return readFileSync(path, 'utf8').replace(/\s+/g, ' ');
   }
 
-  it('D2 keeps both guards inside the UPDATE statement', () => {
+  it('D2 keeps the persona, status and archive_state guards inside the UPDATE', () => {
     const personas = normalize(
       join(import.meta.dirname, '..', 'src', 'repositories', 'personas.ts'),
     );
@@ -215,6 +341,9 @@ describe('conditional update SQL contract', () => {
     expect(personas).toContain('WHERE id = ? AND state = ? AND version = ?');
 
     expect(events).toContain("SET status = 'expired', status_reason = 'buffer_lost'");
-    expect(events).toContain("WHERE id = ? AND status IN ('received', 'accepted')");
+    expect(events).toContain(
+      "WHERE persona_id = ? AND id = ? AND status IN ('received', 'accepted') AND archive_state = 'none'",
+    );
+    expect(events).not.toContain("WHERE id = ? AND status IN ('received', 'accepted')");
   });
 });
