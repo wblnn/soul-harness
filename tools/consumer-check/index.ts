@@ -155,7 +155,7 @@ export const badBoot: PersonaLifecycle = createPersonaLifecycle({
 export const ingress: StimulusIngress = createStimulusIngress({
   store,
   logger: consumerLogger,
-  config: { queueCapacity: 4, bufferTtlMs: 60_000 },
+  config: { queueCapacity: 4, bufferTtlMs: 60_000, personaAdmissionCapacity: 8 },
 });
 
 export const admitted = ingress.acceptStimulus({ stimulus });

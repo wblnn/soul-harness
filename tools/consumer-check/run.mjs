@@ -207,7 +207,7 @@ try {
     store: runtimeStore,
     logger: noop,
     now: () => 8_000,
-    config: { queueCapacity: 2, bufferTtlMs: 1_000 },
+    config: { queueCapacity: 2, bufferTtlMs: 1_000, personaAdmissionCapacity: 8 },
   });
   const canary = 'consumer-canary-body';
   const accepted = await bus.acceptStimulus({

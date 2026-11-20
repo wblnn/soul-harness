@@ -68,6 +68,9 @@ export interface IngressChannelLimits {
   readonly bufferTtlMs: number;
 }
 
+/** Why a committed envelope was closed before its body could stay readable. */
+export type BufferCloseReason = 'ttl_expired' | 'buffer_lost';
+
 /**
  * Required limits. Missing or illegal values throw at construction.
  * There is no silent unlimited default.
@@ -75,14 +78,19 @@ export interface IngressChannelLimits {
  * `channels` replaces both limits for that source. Each persona has its own
  * counters per source; the numbers are the cap, not a shared pool.
  *
- * `queueCapacity` bounds two different counts:
+ * `queueCapacity` bounds two different counts for one persona and one source:
  *   - admission tasks that have passed the gate and not finished (running and
  *     waiting). A further call is refused before it enters the persona queue.
  *   - accepted bodies held in the TTL buffer. That refusal is persisted.
+ *
+ * `personaAdmissionCapacity` bounds every in-flight admission for one persona,
+ * across sources. The persona queue is shared; per-source caps do not add up.
  */
 export interface StimulusIngressConfig {
   readonly queueCapacity: number;
   readonly bufferTtlMs: number;
+  /** In-flight admissions for one persona, every source included. */
+  readonly personaAdmissionCapacity: number;
   readonly channels?: Readonly<Record<string, IngressChannelLimits>>;
 }
 
@@ -166,8 +174,22 @@ export interface IngressBackpressure {
   readonly eventId: null;
 }
 
+/**
+ * The envelope was committed and then closed before ACK.
+ * `status` and `reason` are the row that is actually stored.
+ */
+export interface IngressExpired {
+  readonly outcome: 'expired';
+  readonly eventId: EventId;
+  readonly status: 'expired';
+  readonly reason: BufferCloseReason;
+  readonly sessionId: SessionId | null;
+  readonly receivedAt: number;
+  readonly occurredAt: number | null;
+}
+
 export type IngressResult =
-  IngressAccepted | IngressDuplicate | IngressRefused | IngressBackpressure;
+  IngressAccepted | IngressDuplicate | IngressRefused | IngressBackpressure | IngressExpired;
 
 export interface AcceptStimulusInput {
   /** Closed `soul.stimulus.input.v1` document. `receivedAt` is rejected. */
@@ -220,7 +242,12 @@ export interface StimulusIngress {
   metrics(): IngressMetrics;
 }
 
-const CONFIG_KEYS = new Set(['queueCapacity', 'bufferTtlMs', 'channels']);
+const CONFIG_KEYS = new Set([
+  'queueCapacity',
+  'bufferTtlMs',
+  'personaAdmissionCapacity',
+  'channels',
+]);
 const LIMIT_KEYS = new Set(['queueCapacity', 'bufferTtlMs']);
 const WRAPPER_KEYS = new Set(['stimulus', 'externalSessionRef']);
 
@@ -233,13 +260,20 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
   const buffer = createPerceptionBuffer({ now: readClock, scheduler });
   /** Admission tasks past the gate and not yet finished, per persona and source. */
   const admissionDepth = new Map<string, number>();
+  /** Admission tasks past the gate and not yet finished, per persona. */
+  const personaAdmission = new Map<string, number>();
   /**
-   * Event ids whose body is already gone and whose `ttl_expired` write has not
-   * landed. No payload is stored here.
+   * Event ids whose body is already gone and whose terminal write has not
+   * landed. The reason is metadata only. No payload is stored here.
    */
   const pendingTtl = new Map<
     string,
-    { readonly eventId: EventId; readonly personaId: PersonaId; attempts: number }
+    {
+      readonly eventId: EventId;
+      readonly personaId: PersonaId;
+      readonly reason: BufferCloseReason;
+      attempts: number;
+    }
   >();
   let unverifiable = 0;
   let closed = false;
@@ -317,13 +351,56 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     } else {
       admissionDepth.set(key, left);
     }
+    const personaLeft = (personaAdmission.get(personaId) ?? 1) - 1;
+    if (personaLeft <= 0) {
+      personaAdmission.delete(personaId);
+    } else {
+      personaAdmission.set(personaId, personaLeft);
+    }
+  }
+
+  function scheduleMetadataRetry(
+    personaId: PersonaId,
+    eventId: EventId,
+    reason: BufferCloseReason,
+  ): void {
+    const key = ttlKey(personaId, eventId);
+    try {
+      scheduler.schedule(0, () => {
+        let run: Promise<EventRow | null>;
+        try {
+          run = queue.run(personaId, () => {
+            if (!pendingTtl.has(key) || closed) {
+              return null;
+            }
+            return persistExpire(personaId, eventId, readClock(), reason);
+          });
+        } catch {
+          safeLog('error', 'ingress.ttl_retry_failed', { eventId, personaId, reason });
+          return;
+        }
+        void run.catch(() => {
+          // The id stays on pendingTtl. A clock failure must not drop the record
+          // and must not surface as an unhandled rejection.
+          safeLog('error', 'ingress.ttl_retry_failed', { eventId, personaId, reason });
+        });
+      });
+    } catch {
+      safeLog('error', 'ingress.ttl_retry_unscheduled', { eventId, personaId, reason });
+    }
   }
 
   /**
-   * Writes `ttl_expired` for an event whose body is already unreadable.
+   * Writes a terminal reason for an event whose body is already unreadable.
    * A throw records a metadata-only retry and does not put the body back.
+   * Returns the stored row when the write landed.
    */
-  function persistExpire(personaId: PersonaId, eventId: EventId, now: number): TtlClose | null {
+  function persistExpire(
+    personaId: PersonaId,
+    eventId: EventId,
+    now: number,
+    reason: BufferCloseReason,
+  ): EventRow | null {
     const key = ttlKey(personaId, eventId);
     try {
       options.beforeExpire?.();
@@ -331,50 +408,60 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
         id: eventId,
         personaId,
         updatedAt: now,
-        reason: 'ttl_expired',
+        reason,
       });
       pendingTtl.delete(key);
       if (row === null) {
         return null;
       }
-      safeLog('info', 'ingress.ttl_expired', {
+      safeLog('info', reason === 'ttl_expired' ? 'ingress.ttl_expired' : 'ingress.buffer_lost', {
         eventId: row.id,
         personaId: row.personaId,
         adapterId: row.adapterId,
         source: row.source,
         status: row.status,
-        reason: 'ttl_expired',
+        reason,
       });
-      return { eventId: row.id, personaId: row.personaId, reason: 'ttl_expired' };
+      return row;
     } catch {
       const attempts = (pendingTtl.get(key)?.attempts ?? 0) + 1;
-      pendingTtl.set(key, { eventId, personaId, attempts });
+      pendingTtl.set(key, { eventId, personaId, reason, attempts });
       safeLog('error', 'ingress.ttl_persist_failed', {
         eventId,
         personaId,
-        reason: 'ttl_expired',
+        reason,
         attempt: attempts,
       });
       if (attempts < TTL_PERSIST_ATTEMPT_LIMIT) {
-        try {
-          scheduler.schedule(0, () => {
-            void queue.run(personaId, () => {
-              if (!pendingTtl.has(key) || closed) {
-                return null;
-              }
-              return persistExpire(personaId, eventId, readClock());
-            });
-          });
-        } catch {
-          safeLog('error', 'ingress.ttl_retry_unscheduled', {
-            eventId,
-            personaId,
-            reason: 'ttl_expired',
-          });
-        }
+        scheduleMetadataRetry(personaId, eventId, reason);
       }
       return null;
     }
+  }
+
+  function ttlCloseOf(row: EventRow | null): TtlClose | null {
+    if (row === null || row.status !== 'expired' || row.statusReason !== 'ttl_expired') {
+      return null;
+    }
+    return { eventId: row.id, personaId: row.personaId, reason: 'ttl_expired' };
+  }
+
+  function expiredResult(row: EventRow): IngressExpired | null {
+    if (
+      row.status !== 'expired' ||
+      (row.statusReason !== 'ttl_expired' && row.statusReason !== 'buffer_lost')
+    ) {
+      return null;
+    }
+    return {
+      outcome: 'expired',
+      eventId: row.id,
+      status: 'expired',
+      reason: row.statusReason,
+      sessionId: row.sessionId,
+      receivedAt: row.receivedAt,
+      occurredAt: row.occurredAt,
+    };
   }
 
   function flushPending(personaId: PersonaId): TtlClose[] {
@@ -383,7 +470,9 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       if (item.personaId !== personaId) {
         continue;
       }
-      const result = persistExpire(item.personaId, item.eventId, readClock());
+      const result = ttlCloseOf(
+        persistExpire(item.personaId, item.eventId, readClock(), item.reason),
+      );
       if (result !== null) {
         closedSlots.push(result);
       }
@@ -397,7 +486,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       if (!pendingTtl.has(ttlKey(slot.personaId, slot.eventId))) {
         return null;
       }
-      return persistExpire(slot.personaId, slot.eventId, readClock());
+      return ttlCloseOf(persistExpire(slot.personaId, slot.eventId, readClock(), 'ttl_expired'));
     }
     const now = readClock();
     if (current.expiresAt > now) {
@@ -406,7 +495,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     }
     // The body is unreadable before the database is asked to agree.
     buffer.take(current.personaId, current.eventId);
-    return persistExpire(current.personaId, current.eventId, now);
+    return ttlCloseOf(persistExpire(current.personaId, current.eventId, now, 'ttl_expired'));
   }
 
   function evictPersona(personaId: PersonaId, now: number): void {
@@ -423,7 +512,12 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
         buffer.take(slot.personaId, slot.eventId);
         const key = ttlKey(slot.personaId, slot.eventId);
         if (!pendingTtl.has(key)) {
-          pendingTtl.set(key, { eventId: slot.eventId, personaId: slot.personaId, attempts: 1 });
+          pendingTtl.set(key, {
+            eventId: slot.eventId,
+            personaId: slot.personaId,
+            reason: 'ttl_expired',
+            attempts: 1,
+          });
         }
         safeLog('error', 'ingress.ttl_failed', {
           personaId: slot.personaId,
@@ -662,7 +756,16 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
     if (outcome === 'accepted' && !closed) {
       if (expiresAt <= readClock()) {
         // Receipt-time TTL already elapsed while this task waited. Do not publish the body.
-        persistExpire(written.row.personaId, written.row.id, readClock());
+        const expired = persistExpire(
+          written.row.personaId,
+          written.row.id,
+          readClock(),
+          'ttl_expired',
+        );
+        const reported = expired === null ? null : expiredResult(expired);
+        if (reported !== null) {
+          return reported;
+        }
       } else {
         try {
           remember(written.row, stimulus, expiresAt);
@@ -671,6 +774,16 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
             eventId: written.row.id,
             personaId: written.row.personaId,
           });
+          const expired = persistExpire(
+            written.row.personaId,
+            written.row.id,
+            readClock(),
+            'buffer_lost',
+          );
+          const reported = expired === null ? null : expiredResult(expired);
+          if (reported !== null) {
+            return reported;
+          }
         }
       }
     }
@@ -698,19 +811,26 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       const stimulus = normalizeStimulus(parsed.stimulus, readClock());
       const limits = limitsFor(stimulus.source);
       const depthKey = admissionKey(stimulus.personaId, stimulus.source);
-      const waiting = admissionDepth.get(depthKey) ?? 0;
-      if (waiting >= limits.queueCapacity) {
+      const sourceWaiting = admissionDepth.get(depthKey) ?? 0;
+      const personaWaiting = personaAdmission.get(stimulus.personaId) ?? 0;
+      if (
+        sourceWaiting >= limits.queueCapacity ||
+        personaWaiting >= options.config.personaAdmissionCapacity
+      ) {
         safeLog('warn', 'ingress.admission_backpressure', {
           personaId: stimulus.personaId,
           source: stimulus.source,
           adapterId: stimulus.adapterId,
-          waiting,
+          sourceWaiting,
+          personaWaiting,
           queueCapacity: limits.queueCapacity,
+          personaAdmissionCapacity: options.config.personaAdmissionCapacity,
           reason: 'queue_overflow',
         });
         return { outcome: 'backpressure', reason: 'queue_overflow', eventId: null };
       }
-      admissionDepth.set(depthKey, waiting + 1);
+      admissionDepth.set(depthKey, sourceWaiting + 1);
+      personaAdmission.set(stimulus.personaId, personaWaiting + 1);
       try {
         return await queue.run(stimulus.personaId, () =>
           admit(stimulus, parsed.externalSessionRef),
@@ -734,7 +854,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       const now = readClock();
       if (slot.expiresAt <= now) {
         buffer.take(personaId, eventId);
-        persistExpire(personaId, eventId, now);
+        persistExpire(personaId, eventId, now, 'ttl_expired');
         return null;
       }
       return {
@@ -755,7 +875,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
       for (const slot of buffer.list(personaId)) {
         if (slot.expiresAt <= now) {
           buffer.take(slot.personaId, slot.eventId);
-          persistExpire(slot.personaId, slot.eventId, now);
+          persistExpire(slot.personaId, slot.eventId, now, 'ttl_expired');
           continue;
         }
         visible.push({
@@ -816,7 +936,7 @@ export function createStimulusIngress(options: StimulusIngressOptions): Stimulus
         return;
       }
       for (const item of [...pendingTtl.values()]) {
-        persistExpire(item.personaId, item.eventId, now);
+        persistExpire(item.personaId, item.eventId, now, item.reason);
       }
       pendingTtl.clear();
     },
@@ -991,6 +1111,7 @@ function assertConfig(config: StimulusIngressConfig): void {
   }
   assertLimit(config.queueCapacity, 'queueCapacity');
   assertLimit(config.bufferTtlMs, 'bufferTtlMs');
+  assertLimit(config.personaAdmissionCapacity, 'personaAdmissionCapacity');
   if (config.channels === undefined) {
     return;
   }

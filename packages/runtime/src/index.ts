@@ -61,6 +61,7 @@ export type {
   IngressBackpressure,
   IngressChannelLimits,
   IngressDuplicate,
+  IngressExpired,
   IngressMetrics,
   IngressPersistView,
   IngressRefused,
@@ -71,4 +72,5 @@ export type {
   StimulusIngressOptions,
   TtlClose,
 } from './events/bus.js';
+export type { BufferCloseReason } from './events/bus.js';
 export type { IngressScheduler, IngressTimer } from './events/buffer.js';

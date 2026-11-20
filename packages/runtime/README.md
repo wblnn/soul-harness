@@ -59,12 +59,14 @@
 
 `createStimulusIngress({ store, logger, config, now?, randomBytes?, timers?, beforePersist?, duringRead?, beforeExpire? })` 返回进程内 Ingress。没有适配器注册表，也没有鉴权。**只能被同一进程和测试调用。** SH-009 才把它挂到 loopback HTTP。
 
-配置是必填的。`queueCapacity` 与 `bufferTtlMs` 都必须是大于等于 1 的安全整数。`channels` 按 `source` 覆盖这两项，覆盖项自己也必须两项都合法。缺配置、0、负数、小数、非法 source，构造时抛 `invalid_argument`。没有「不填就无限」的默认值。每个 `personaId` 按 `source` 各算各的数量，互不占用。
+配置是必填的。`queueCapacity`、`bufferTtlMs` 与 `personaAdmissionCapacity` 都必须是大于等于 1 的安全整数。`channels` 按 `source` 覆盖前两项，覆盖项自己也必须两项都合法。`personaAdmissionCapacity` 不按 source 拆。缺配置、0、负数、小数、非法 source，构造时抛 `invalid_argument`。没有「不填就无限」的默认值。
 
-`queueCapacity` 是两道硬上限，不是一道：
+在途受理有两级上限，都在进入人格队列**之前**检查。超出则 `outcome: 'backpressure'`、`reason: 'queue_overflow'`，不落库、不分配 `eventId`、不保留正文：
 
-1. **等待受理。** 已经通过入口、还没跑完的任务（正在执行的和排在它后面的）最多 `queueCapacity` 个。再来的调用在进入人格队列**之前**得到 `outcome: 'backpressure'`、`reason: 'queue_overflow'`。这次不落库、不分配 `eventId`、不保留正文。调用方可以稍后再试。
-2. **已受理正文。** 内存里还没过期的正文最多 `queueCapacity` 份。任务真正执行时若缓冲已满，信封会落成 `expired` + `queue_overflow`，结果是 `refused`。这和上一道不是同一件事：上一道拒绝发生在入队前，这一道发生在已经拿到人格队列之后。
+1. **每个 source。** 同一 `personaId` 同一 `source` 上，已经通过入口、还没跑完的任务最多 `queueCapacity` 个。
+2. **整个人格。** 同一 `personaId` 上，所有 source 加在一起的在途受理最多 `personaAdmissionCapacity` 个。底层队列按人格串行，只限制单个 source 挡不住换一个合法 source 再投。
+
+另外，内存里还没过期的正文，每个 source 最多 `queueCapacity` 份。任务真正执行时若缓冲已满，信封会落成 `expired` + `queue_overflow`，结果是 `refused`。这是已经拿到队列之后的事，和上面的 `backpressure` 不是同一条路径。
 
 `acceptStimulus({ stimulus, externalSessionRef? })` 返回 Promise。参数不合法时拒绝这个 Promise，不在调用当场抛出。校验通过后会立刻深拷贝并冻结信封，再用当时的时钟写入 `receivedAt`。之后调用方改原对象，不会改排队键、去重键、落库字段或缓冲正文。`receivedAt` 是入口时间，不是任务开始执行的时间。
 
@@ -72,11 +74,11 @@
 |---|---|
 | 校验 | 用 contracts 的 `soul.stimulus.input.v1` 校验 `stimulus`。带 `receivedAt` 或未知顶层字段 → `schema_invalid`，不落库。通过后立刻快照 |
 | 时钟 | 入队前用可注入时钟写入 `receivedAt`，再校验 `soul.stimulus.v1`。`occurredAt` 原样保留，包括它远早于 `receivedAt` 的情况 |
-| 背压 | 该人格该 source 的在途受理数已经达到 `queueCapacity` → `backpressure`，不入队 |
+| 背压 | 该 source 的在途数达到 `queueCapacity`，或该人格全部 source 的在途数达到 `personaAdmissionCapacity` → `backpressure`，不入队 |
 | 去重 | 键是 `(personaId, adapterId, source, adapterEventRef)`，在同一次 `withRead` 里和人格行一起读。命中则返回既有 `eventId` 与 `status`，`bodyVerified` 恒为 `false`，指标 `dedupe.body_unverifiable` +1。不读正文、不写正文、不调用 `archive.compare`。`expired` / `rejected` 保持终态 |
 | 会话 | 有 `externalSessionRef` 时，复用 `(personaId, adapterId, externalSessionRef)` 上仍开着的 `sessionId`。已关闭的不复活，另分配新 id。没有这个字段则 `sessionId` 为 null |
 | 落库 | 未命中时分配 `eventId`（占用则重试；唯一约束冲突再读去重键，命中则按上面的幂等返回）。短事务里先写 `received`，同一提交进入 `accepted`（`archive_state='none'`、`disposition` 与 `archive_ref` 皆 NULL）。缓冲已满则同一提交进入 `expired` + `queue_overflow`，结果是 `refused` |
-| ACK | 事务提交之后才返回。正文只在提交成功、结果为 `accepted`、且 TTL 尚未到期时进入内存缓冲。定时器登记失败则不留正文，并打 `ingress.buffer_failed`；信封提交仍然有效 |
+| ACK | 事务提交之后才返回，而且返回值跟库里的行一致。若提交前 TTL 已经过了，正文不进缓冲，行收成 `expired` + `ttl_expired`，结果是 `outcome: 'expired'`。定时器登记失败同样不留正文，并尽量把行收成 `expired` + `buffer_lost`（缓冲没能留下，不是时间到期）。这次收口若写库失败，行仍是 `accepted`，事件 id 进入不含正文的重试名单，返回值也仍是 `accepted` |
 | TTL | `readBuffered` 自己看时钟。`expiresAt <= now` 时先从内存删掉正文并返回 `null`，然后再尝试把活跃行收成 `ttl_expired`。数据库写失败不会把正文放回去；失败记 `ingress.ttl_persist_failed`，事件 id 留在不含正文的重试名单里，之后的 `evictExpired` 或同人格的下一次受理会再写元数据。已经是终态的行不改。`close()` 取消定时器并丢掉缓冲 |
 
 `accepted` 只表示信封已经落库。`audited` 恒为 `false`。本批不会把事件推进到 `noticed` / `understood` / `response_committed` / `acted`。
@@ -125,11 +127,11 @@ packages/runtime/
 │  ├─ ids/{encode,allocate}.ts      # 冻结编码与分配
 │  ├─ persona/{lifecycle,queue}.ts  # 状态机与人格级写队列
 │  └─ events/{schema,buffer,bus}.ts # P1 校验、TTL 缓冲、进程内 Ingress
-└─ test/                            # 80 项
+└─ test/                            # 83 项
    ├─ allocator.test.ts             # 29 项。向量、时钟、碰撞、SQLite 主键
    ├─ allocator-sample.test.ts      # 2 项。OPEN-7 大样本
    ├─ persona-lifecycle.test.ts     # 21 项。真实 SQLite 上的生命周期
-   └─ ingress.test.ts               # 28 项。真实 SQLite 上的 P1 Ingress
+   └─ ingress.test.ts               # 31 项。真实 SQLite 上的 P1 Ingress
 ```
 
 ## 5. 依赖
@@ -191,7 +193,7 @@ close(): void
 metrics(): { 'dedupe.body_unverifiable': number }
 ```
 
-`IngressResult` 是 `accepted`（`audited: false`）、`duplicate`（`bodyVerified: false`，状态可以是终态）、`refused`（缓冲已满，已落成 `expired` + `queue_overflow`）或 `backpressure`（在途受理已满，未入队、未落库）。没有 HTTP 状态码。
+`IngressResult` 是 `accepted`（`audited: false`）、`duplicate`（`bodyVerified: false`，状态可以是终态）、`expired`（提交后、ACK 前已经收成 `ttl_expired` 或 `buffer_lost`）、`refused`（缓冲已满，已落成 `expired` + `queue_overflow`）或 `backpressure`（在途受理已满，未入队、未落库）。没有 HTTP 状态码。
 
 错误码：`invalid_argument` / `invalid_clock` / `invalid_entropy` / `id_collision` / `id_encoding` / `not_found` / `illegal_transition` / `version_conflict` / `schema_invalid` / `closed`。消息不回显时钟、熵、候选 ID、display name 或刺激正文。存储层的 `store_closed` 等错误原样抛出，不包装成 RuntimeError（创建人格时的唯一约束除外，包装成 `id_collision`；Ingress 在去重键冲突时改走幂等返回）。
 
@@ -202,7 +204,7 @@ metrics(): { 'dedupe.body_unverifiable': number }
 | `test/allocator.test.ts` | 29 项。已知向量、前缀不可混用、时钟进退、碰撞重试、真实 SQLite 主键冲突不覆盖、`src/` 无 SQL / 无环境读取，且只依赖 contracts 与 persistence |
 | `test/allocator-sample.test.ts` | 2 项。每个前缀 10000 个 ID，另加同毫秒突发 10000 个；全部通过 contracts 的 `is*` / `parse*`，样本内唯一 |
 | `test/persona-lifecycle.test.ts` | 21 项。真实迁移后的 SQLite：合法与非法转移、任意状态 stop、按 boot 区分的崩溃归一、按 ID 恢复且不新建、多人格隔离、同人格并发、过期 version 不覆盖、epoch 不变、检查点不被生命周期写掉、分页列表、日志失败不掩盖提交、双连接读快照、非法参数拒绝 Promise |
-| `test/ingress.test.ts` | 28 项。真实 SQLite：信封正反例与注入时钟、去重不插第二行且不声称正文一致、终态不重开、唯一约束冲突后的幂等收敛、会话复用与关闭后新建、金丝雀正文只活在 TTL 缓冲里、两道队列上限、入队前背压、过期正文不可读、TTL 元数据失败后的重试、定时器登记失败不留正文、快照不被事后篡改、`receivedAt` 取入口时间、人格与 source 隔离、同人格串行、日志失败不掩盖结果、非法配置与非法参数拒绝 Promise |
+| `test/ingress.test.ts` | 31 项。真实 SQLite：信封正反例与注入时钟、去重不插第二行且不声称正文一致、终态不重开、唯一约束冲突后的幂等收敛、会话复用与关闭后新建、金丝雀正文只活在 TTL 缓冲里、source 与人格两级在途上限、入队前背压、过期正文不可读、受理期间 TTL 到期时返回值与库一致、TTL 元数据失败后的重试且时钟抛错不产生未处理 rejection、定时器登记失败收成 `buffer_lost`、快照不被事后篡改、`receivedAt` 取入口时间、人格与 source 隔离、同人格串行、日志失败不掩盖结果、非法配置与非法参数拒绝 Promise |
 
 OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」写成验收。
 
@@ -217,6 +219,6 @@ OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」
 5. 读操作不进写队列，因此可能看见 `STARTING` / `STOPPING` 这两个已经提交的中间态。
 6. 已经 `STOPPED` 的 `stop` 不会顺便修理一张和人格行不一致的 `runtime_state`。正常路径的写入是一起提交的。
 7. 没有任务调度、扫描 A/B、检查点编排，也没有 HTTP。P1 的 `accepted` 不是审计，也不是已经理解。进程重启后内存缓冲不在；把因此丢失的活跃事件收成 `buffer_lost` 属于 SH-008E。
-8. 两道容量都记在本 Ingress 实例的内存里。两个 Ingress 共用一个库时，容量不会加总；生产部署是一个 Daemon、一个 Ingress。入队前的 `backpressure` 不会写成事件行。
-9. 正文过期不依赖数据库。元数据写失败时，正文已经不可读；只把 `eventId` 留在重试名单里，自动定时重试最多 3 次，之后靠 `evictExpired` 或同人格的下一次受理补写。`close()` 会再试一次然后丢掉这份名单。进程退出后仍是 `accepted` 的行，要等 SH-008E 按缓冲丢失收口。
+8. 在途上限和正文缓冲都记在本 Ingress 实例的内存里。两个 Ingress 共用一个库时，容量不会加总；生产部署是一个 Daemon、一个 Ingress。入队前的 `backpressure` 不会写成事件行。`personaAdmissionCapacity` 管的是在途受理，不管已经落库的正文份数。
+9. 正文过期或缓冲登记失败都不依赖「先把库写成功」。元数据写失败时，正文已经不可读；只把 `eventId` 和原因码留在重试名单里，自动定时重试最多 3 次，之后靠 `evictExpired` 或同人格的下一次受理补写。重试回调里的异常会被接住，不会变成未处理的 rejection。`close()` 会再试一次然后丢掉这份名单。进程退出后仍是 `accepted` 的行，要等 SH-008E 按缓冲丢失收口。`buffer_lost` 在这里表示缓冲没能留下，不是崩溃扫描那条路径。
 10. `externalSessionRef` 会进 `sessions.external_id`。金丝雀测试覆盖的是刺激正文，不是这个适配器会话键。
