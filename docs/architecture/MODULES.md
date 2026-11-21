@@ -1,7 +1,7 @@
 # MODULES — 模块边界与依赖规则
 
 - **地位**：模块职责与依赖方向的唯一权威描述。新增跨模块依赖前必须先改本文件。
-- **状态**：`contracts`（协议层，SH-004）、`persistence`（SH-006A–D）与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 已完成 ID 分配（SH-008A）与进程内 Persona 生命周期（SH-008B）；事件总线、调度、恢复扫描与 Daemon 装配仍未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
+- **状态**：`contracts`（协议层，SH-004）、`persistence` 的 SH-006A–D 与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 包内已有 ID 分配（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）和 P1 `recoverRuntime`（SH-008D D2，代码已提交，审查与批次验收均无通过记录）。Scheduler（D3）、扫描 A/B、检查点装载/写出与 Daemon 装配（SH-008E）未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
 - **原则**：不为目录完整而创建空类。模块目录先有 `README.md` 说明职责与当前状态，代码在对应阶段再写。
 
 ---
@@ -45,8 +45,8 @@
 | 包 | 负责 | 不负责 | 状态 |
 |---|---|---|---|
 | `contracts` | 协议类型、JSON Schema（**含 Stimulus 信封与 `requestNonce` 校验规则**）、**身份 ID 格式与生成契约**（`IDENTITY-PROTOCOL.md`）、版本与能力常量 | 运行时逻辑、IO、状态、**数据库列映射**、注册表查询、**不实际分配 ID** | **已实现（协议层）**，测试见 `packages/contracts/test/` |
-| `persistence` | SQLite 连接、单写入协调器、事务、migration、检查点、密钥指针、**camelCase↔snake_case 映射** | 业务语义；不判断"该不该记" | **SH-006A–D 已完成**：连接、WAL 打开、单写入事务、migration、六表 Repository、字段映射、Runtime checkpoint envelope 存取。密钥指针未交付。无显式 `PRAGMA wal_checkpoint`，不重建 Runtime |
-| `runtime` | Persona 生命周期、事件总线、任务队列、状态恢复（**pending 归档恢复 + failed 缓冲清理两类扫描**）、提案验证与提交、版本/epoch 控制、**归档决策与冲突审计记录写入**、**六类身份 ID 的分配**（见 `IDENTITY-PROTOCOL.md`）、**入站去重与去重命中后的正文核对**（`compare` 的**唯一**调用方） | 语义解释；不生成回答；**不读 Archive**、不持有 Archive 密钥；不接受外部指定的内部 ID | **部分实现（SH-008A–B）**：ID 分配，以及进程内 Persona 生命周期（经 persistence 仓储，无裸 SQL）。测试见 `packages/runtime/test/`。事件总线、任务队列、恢复扫描、检查点编排、Daemon 装配、去重与 `compare` 调用仍未实现 |
+| `persistence` | SQLite 连接、单写入协调器、事务、migration、检查点、密钥指针、**camelCase↔snake_case 映射** | 业务语义；不判断"该不该记" | **SH-006A–D 已完成**：连接、WAL 打开、单写入事务、migration、六表 Repository、字段映射、Runtime checkpoint envelope 存取。密钥指针未交付。无显式 `PRAGMA wal_checkpoint`，不重建 Runtime。其后已合并但未另做批次验收的代码：SH-008P 键集分页与条件写、SH-008C 会话复用与 P1 信封提交、SH-008D D1 任务条件状态机（D1 无独立审查通过记录） |
+| `runtime` | Persona 生命周期、事件总线、任务队列、状态恢复（**pending 归档恢复 + failed 缓冲清理两类扫描**）、提案验证与提交、版本/epoch 控制、**归档决策与冲突审计记录写入**、**六类身份 ID 的分配**（见 `IDENTITY-PROTOCOL.md`）、**入站去重与去重命中后的正文核对**（`compare` 的**唯一**调用方） | 语义解释；不生成回答；**不读 Archive**、不持有 Archive 密钥；不接受外部指定的内部 ID | **包内部分有代码**：SH-008A ID 分配；SH-008B 进程内 Persona 生命周期（含崩溃归一函数）；SH-008C 进程内去重（不调用 `compare`，`bodyVerified` 恒为 false）；SH-008D D2 `recoverRuntime`（P1 任务与活跃事件收敛，不是扫描 A/B，不是检查点；代码提交至 D2.R4，无审查通过或批次验收记录）。经 persistence 仓储，无裸 SQL。测试见 `packages/runtime/test/`。任务队列 / Scheduler、扫描 A/B、检查点编排、Daemon 装配、`compare` 调用仍未实现 |
 | `personality` | 自我叙事、情绪、关系多维表征、特质缓变 | 不写记忆正文；不授权现实动作 | 未实现 |
 | `attention` | 前注意过滤、优先级、唤醒分级、注意结果（ignored/queued/aware） | 不理解内容；不生成回应 | 未实现 |
 | `perception` | 感知规范化、选择性编码判定、短暂缓冲（TTL） | 不长期保存原文；不建立关联 | 未实现 |
@@ -93,7 +93,7 @@
 **当前代码（不改写上表的目标职责）**：
 
 - `apps/soul-daemon`（SH-007A）已实现配置、结构化日志、数据目录探测、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机与资源逆序释放。进程可以进入 `RUNNING`，但这只表示它持有数据库与锁，**人格认知循环没有运行**。
-- 同一应用**未实现**：Persona 恢复、Runtime 恢复、Event Bus、Scheduler（源码标为 `not_implemented`，owner 记为 SH-008；SH-008 进行中，目前只有 SH-008A 的 ID 分配器，Daemon 尚未装配）、HTTP / WebSocket、健康检查（owner 记为 SH-009；未开始）。
+- 同一应用**未装配**：Persona 恢复、Runtime 恢复、Event Bus、Scheduler。源码把这四步标为 `not_implemented`，owner 字符串仍是 `SH-008`。装配批次是 SH-008E，未开始。包内已有 `normalizeCrashedPersonas`、进程内 Ingress 和 `recoverRuntime`；Scheduler（SH-008D D3）在包内也还没有。HTTP / WebSocket、健康检查的 owner 是 SH-009，未开始。
 - `CHECKPOINTING` 跳过的是 Runtime checkpoint（`runtime_state.checkpoint_json`），不是 SQLite WAL checkpoint。关闭数据库没有显式 `PRAGMA wal_checkpoint`；`DatabaseSync.close()` 可能触发 SQLite 默认自动 checkpoint。
 - SH-007B 不是下一代码批次，也不单独实施代码。它依赖 SH-008（Persona / Runtime 恢复、Event Bus、Scheduler）与 SH-009（HTTP / WebSocket、健康检查）接入真实组件之后，再验收 Daemon 的启动、就绪、关闭、资源释放与失败处理。细项通过标准不在此预先规定。
 - `soul-studio`、`soul-cli` 目录不存在。上表对它们的描述仍是目标职责。
