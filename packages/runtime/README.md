@@ -1,7 +1,7 @@
 # `@soul-harness/runtime` — 认知运行时
 
 - **地位**：L3 编排层。业务逻辑在这里，不在 Daemon（[MODULES](../../docs/architecture/MODULES.md) §2–§4）。
-- **状态**：**SH-008A 已完成：ID 分配器。SH-008B 已完成：进程内 Persona 生命周期。SH-008C 已完成：进程内 P1 Ingress。SH-008D D2 已完成：P1 Runtime Recovery（`recoverRuntime`）。** Scheduler（D3）、扫描 A/B、检查点装载/写出、Daemon 装配仍没有，对应 SH-008D 剩余批次与 SH-008E。本目录没有这些能力的空类。
+- **状态**：包内已有代码：SH-008A ID 分配器；SH-008B 进程内 Persona 生命周期；SH-008C 进程内 P1 Ingress；SH-008D D2 的 `recoverRuntime`（提交至 D2.R4）。D2 没有独立审查通过记录，也没有批次验收记录，最近一笔是审查修复。Scheduler（D3）、D4 集成与文档收尾没有开始。扫描 A/B、检查点装载/写出不在本包。Daemon 装配是 SH-008E，没有开始。本目录没有 Scheduler、扫描 A/B、检查点编排或 Daemon 的空类。
 - **上位文档**：[RUNTIME-LIFECYCLE](../../docs/architecture/RUNTIME-LIFECYCLE.md) §4–§5、§7、§9，[IDENTITY-PROTOCOL](../../docs/architecture/IDENTITY-PROTOCOL.md) §3、§4.2、§4.5、§4.5.1，[DATA-MODEL](../../docs/architecture/DATA-MODEL.md) §3、§3.1、§6，[PLAN](../../docs/PLAN.md) §6.3，[MODULES](../../docs/architecture/MODULES.md) §2–§3。
 
 ## 1. 负责什么
@@ -166,12 +166,14 @@ packages/runtime/
 │  ├─ errors.ts                     # RuntimeError
 │  ├─ ids/{encode,allocate}.ts      # 冻结编码与分配
 │  ├─ persona/{lifecycle,queue}.ts  # 状态机与人格级写队列
-│  └─ events/{schema,buffer,bus}.ts # P1 校验、TTL 缓冲、进程内 Ingress
-└─ test/                            # 88 项
+│  ├─ events/{schema,buffer,bus}.ts # P1 校验、TTL 缓冲、进程内 Ingress
+│  └─ recovery/{recover,budget}.ts  # P1 Runtime Recovery（SH-008D D2）
+└─ test/                            # 149 项
    ├─ allocator.test.ts             # 29 项。向量、时钟、碰撞、SQLite 主键
    ├─ allocator-sample.test.ts      # 2 项。OPEN-7 大样本
    ├─ persona-lifecycle.test.ts     # 24 项。真实 SQLite 上的生命周期
-   └─ ingress.test.ts               # 33 项。真实 SQLite 上的 P1 Ingress
+   ├─ ingress.test.ts               # 33 项。真实 SQLite 上的 P1 Ingress
+   └─ recovery.test.ts              # 61 项。真实 SQLite 上的 P1 Runtime Recovery
 ```
 
 ## 5. 依赖
@@ -245,10 +247,11 @@ metrics(): { 'dedupe.body_unverifiable': number }
 | `test/allocator-sample.test.ts` | 2 项。每个前缀 10000 个 ID，另加同毫秒突发 10000 个；全部通过 contracts 的 `is*` / `parse*`，样本内唯一 |
 | `test/persona-lifecycle.test.ts` | 24 项。真实迁移后的 SQLite：合法与非法转移、任意状态 stop、按 boot 区分的崩溃归一、按 ID 恢复且不新建、多人格隔离、同人格并发、过期 version 不覆盖、epoch 不变、检查点不被生命周期写掉、分页列表、日志失败不掩盖提交、双连接读快照、非法参数拒绝 Promise。创建路径另含：预检查发现 id 已占用时换号、插入撞上真实主键冲突时换号且不留下半截行、重试耗尽返回 `id_collision`、非唯一约束错误原样抛出 |
 | `test/ingress.test.ts` | 33 项。真实 SQLite：信封正反例与注入时钟、去重不插第二行且不声称正文一致、终态不重开、唯一约束冲突后的幂等收敛、会话复用与关闭后新建、金丝雀正文只活在 TTL 缓冲里、source 与人格两级在途上限、入队前背压、过期正文不可读、受理期间 TTL 到期时返回值与库一致、提交后时钟抛错仍返回已提交状态并进入无正文收口队列、TTL 元数据失败后的重试且时钟抛错不产生未处理 rejection、定时器登记失败与提前触发后重注册失败都收成 `processing_failed`、快照不被事后篡改、`receivedAt` 取入口时间、人格与 source 隔离、同人格串行、日志失败不掩盖结果、非法配置与非法参数拒绝 Promise |
+| `test/recovery.test.ts` | 61 项。真实 SQLite：`recoverRuntime` 的参数与预算、U1–U6、`attempt` 在恢复时不变、取消边界、无法物化的 attempt 按 `invalid_task_row` 失败关闭 |
 
 OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」写成验收。
 
-`tools/consumer-check` 以包名导入 `createPersonaLifecycle` 与 `createStimulusIngress`，在构建产物上跑通人格生命周期和一次受理 / 去重，并确认 `createRuntime`、`enqueueTask`、`recover`、`checkpointAll` 尚未导出。
+`tools/consumer-check` 以包名导入 `createPersonaLifecycle` 与 `createStimulusIngress`，在构建产物上跑通人格生命周期和一次受理 / 去重，并确认 `createRuntime`、`enqueueTask`、`recover`、`checkpointAll` 这四个名字没有导出。`recoverRuntime` 是另一个导出，已经存在；consumer-check 不把名字 `recover` 当成它。
 
 ## 8. 已知限制
 
@@ -258,7 +261,7 @@ OPEN-7 的样本量就是那两个 **10000**。不把「统计上永不碰撞」
 4. 本包被构建、被测试，**不表示** Daemon 已经在恢复人格或受理事件。`normalizeCrashedPersonas` 不会自己在进程启动时跑。调用它的独占 `RECOVERING` 顺序属于 SH-008E。
 5. 读操作不进写队列，因此可能看见 `STARTING` / `STOPPING` 这两个已经提交的中间态。
 6. 已经 `STOPPED` 的 `stop` 不会顺便修理一张和人格行不一致的 `runtime_state`。正常路径的写入是一起提交的。
-7. 没有任务调度、扫描 A/B、检查点编排，也没有 HTTP。P1 的 `accepted` 不是审计，也不是已经理解。进程重启后内存缓冲不在；把因此丢失的活跃事件收成 `buffer_lost` 属于 SH-008E。
+7. 没有任务调度、扫描 A/B、检查点编排，也没有 HTTP。P1 的 `accepted` 不是审计，也不是已经理解。进程重启后内存缓冲不在。`recoverRuntime` 会把仍为 `received` / `accepted` 且 `archive_state='none'` 的行收成 `expired` + `buffer_lost`；这是包内函数。Daemon 启动时不调用它。把这次调用排进独占的 `RECOVERING` 属于尚未开始的 SH-008E。不调用该函数就重启，这些行会停在原来的活跃状态。
 8. 在途上限和正文缓冲都记在本 Ingress 实例的内存里。两个 Ingress 共用一个库时，容量不会加总；生产部署是一个 Daemon、一个 Ingress。入队前的 `backpressure` 不会写成事件行。`personaAdmissionCapacity` 管的是在途受理，不管已经落库的正文份数。
 9. 正文过期或缓冲登记失败都不依赖「先把库写成功」。元数据写失败时，正文已经不可读；只把 `eventId` 和原因码留在重试名单里，自动定时重试最多 3 次，之后靠 `evictExpired` 或同人格的下一次受理补写。重试回调里的异常会被接住，不会变成未处理的 rejection。提交已经成功之后，时钟再抛错也不会把这次调用变成失败。`close()` 会再试一次然后丢掉这份名单。进程退出后仍是 `accepted` 的行，要等 SH-008E 按 `buffer_lost` 收口。本批运行期不用 `buffer_lost`；缓冲没能留下时用 `rejected` + `processing_failed`。
 10. `externalSessionRef` 会进 `sessions.external_id`。金丝雀测试覆盖的是刺激正文，不是这个适配器会话键。

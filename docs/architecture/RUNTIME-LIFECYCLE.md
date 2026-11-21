@@ -1,7 +1,7 @@
 # RUNTIME-LIFECYCLE — 运行时生命周期
 
 - **地位**：Daemon、Persona、Thought、Event、Sleep 的状态机与启停顺序权威描述。
-- **状态**：下表是目标顺序，不是完成清单。SH-007A 只实现了基础设施半段（配置、日志、数据目录、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机）。Persona / Runtime 恢复、Event Bus、Scheduler、API 未实现。进入 `RUNNING` 不表示人格认知循环已运行。
+- **状态**：下表是目标顺序，不是完成清单。SH-007A 只实现了基础设施半段（配置、日志、数据目录、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机）。`packages/runtime` 里已经有进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）和 P1 `recoverRuntime`（SH-008D D2，代码已提交，独立审查与批次验收都没有通过记录）。Daemon 不调用它们：Persona Recovery、Runtime Recovery、Event Bus 的装配属于尚未开始的 SH-008E。Scheduler（SH-008D D3）与 API（SH-009）没有开始。进入 `RUNNING` 只表示进程持有数据库与锁，人格认知循环没有运行。
 - **实现注记**：状态名在已落地的 Daemon 代码中是集中常量，不得在新代码里散落同义字符串。
 
 ---
@@ -35,6 +35,16 @@
 
 **顺序是硬的。** 特别地：没有单实例锁就不许开库；没跑完 Migration 不许恢复 Persona；API 最后开。
 
+> **当前实现（不修改上表的目标顺序）。** 步骤 1–6 与进入 `RUNNING` 的状态机是 SH-007A。
+>
+> | 步骤 | 包内已有的代码 | Daemon 今天实际做的事 |
+> |---|---|---|
+> | 7 恢复 Persona | `normalizeCrashedPersonas`（SH-008B）：只把其它 boot 留下的 `STARTING` / `STOPPING` 收成 `STOPPED`，不自动 start | `persona_recovery` 仍是 `not_implemented`。独占 `RECOVERING`、且先于本 boot 的启停，属于未开始的 SH-008E |
+> | 8 恢复 Runtime | `recoverRuntime`（SH-008D D2，提交至 D2.R4）：P1 崩溃收敛。合法 `running` 任务按 §4 的 D-RT1 退回 `queued` 或转 `failed`；`received` / `accepted` 且 `archive_state='none'` 收成 `expired` + `buffer_lost`。不读检查点，不恢复队列或活跃思维，不领取任务 | `runtime_recovery` 仍是 `not_implemented`，注释仍写检查点 / 队列 / 思维。装配属于 SH-008E，未开始。D2 没有独立审查通过或批次验收的记录 |
+> | 9 Event Bus | 进程内 P1 Ingress（SH-008C）：`createStimulusIngress` / `acceptStimulus`。无 HTTP | `event_bus` 仍是 `not_implemented`。装配属于 SH-008E，未开始 |
+> | 10 Scheduler | 无。SH-008D D3 未开始 | `scheduler` 仍是 `not_implemented` |
+> | 11–12 API / 健康检查 | 无 | 属未开始的 SH-009 |
+
 ## 3. Daemon 关闭顺序
 
 `RUNNING` → `DRAINING` → `CHECKPOINTING` → `CLOSING` → `STOPPED`
@@ -56,15 +66,27 @@
 
 ## 4. 崩溃恢复规则
 
+任务 `attempt` 以已批准的 R8.3 决议 **D-RT1** 为准。本文件只复述该决议，不另立语义：
+
+1. 任务被 Scheduler 领取时，`attempt` 加 1，并写入新的 `runId`。
+2. 任务运行期间 `attempt` 不变。
+3. 运行失败后的重试，在下一次重新领取时加 `attempt`。
+4. 崩溃恢复不增加 `attempt`。
+5. 恢复后仍沿用原 `attempt`。
+
 | 场景 | 规则 |
 |---|---|
 | Persona 处于 `STARTING` / `STOPPING` | 归一到 `STOPPED`，要求显式重启，不自动猜 |
-| 存在 `running` 状态的 task | 重置为 `queued` 并 `attempt+1`；超过上限转 `failed` |
+| 存在 `running` 状态的 task | 按 D-RT1 崩溃恢复：`attempt` 不变，沿用原 `attempt` 与当前 `runId`。未达上限则退回 `queued`；达到或超过上限转 `failed`。恢复不是一次新的领取，不加 `attempt`，不写新 `runId` |
 | 睡眠周期中断 | 记录**已完成**的周期数，不补账、不声称做过 |
 | 梦境中断 | `outcome=INTERRUPTED`，不生成醒后片段 |
 | 已提交但索引未刷新 | 启动时按 `content_epoch` 重建派生索引 |
 | 检查点 `epoch < 当前 epoch` | 丢弃该检查点（不得越过墓碑） |
 | 动作处于 `executing` | 用 `actionId` 向适配器核对；**未收到回执一律不标记成功** |
+
+> **D-RT1 与当前代码的对应（不另加规则）。** 领取是 persistence 的 `claimNext`：同一条 `UPDATE` 里 `attempt + 1`，写入调用方给出的新 `runId`，`started_at` 写成领取时刻。运行期间 `completeTask` / `failTask` 用当前 `run_id` 与 `attempt` 做条件写，不改 `attempt`。失败且未达上限时，`failTask` 把行退回 `queued`，`attempt` 仍是这一次领取写下的值；下一次重新领取才再加 1 并写入另一个 `runId`。崩溃恢复是 `recoverRunningTask`：未达上限则退回 `queued`，语句不改 `attempt`、不改 `run_id`；达到或超过上限则 `failed`。`recoverRuntime` 对合法的 `running` 行调用它。
+>
+> Scheduler 负责领取，批次是 SH-008D D3，尚未开始。Daemon 不调用 `claimNext`，也不调用 `recoverRuntime` 或 `normalizeCrashedPersonas`。因此上表是恢复规则，不是「进程重启今天会自动执行」的完成声明。
 
 ## 5. Persona 状态机
 

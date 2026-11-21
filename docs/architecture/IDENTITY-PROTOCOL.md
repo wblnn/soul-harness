@@ -1,7 +1,7 @@
 # IDENTITY-PROTOCOL — 六类核心身份协议
 
 - **地位**：身份语义的唯一权威描述。与 `OVERVIEW.md` §5 的概览表冲突时，以本文为准。
-- **状态**：**协议已冻结。** 格式校验已在 SH-004（`packages/contracts`）落地。ID 分配器已在 SH-008A（`packages/runtime`）实现并通过测试。Ingress、调度、动作身份的运行时路径，以及 §12 里未写明完成的验收项，仍未实现。
+- **状态**：**协议已冻结。** 格式校验已在 SH-004（`packages/contracts`）落地。ID 分配器已在 SH-008A（`packages/runtime`）实现并通过该批测试。进程内 P1 Ingress 的代码已在 SH-008C 合并（包内函数；Daemon 未装配；§12 标成「部分」的只覆盖写明的那一层）。调度器（SH-008D D3）与动作身份的运行时路径未实现。§12 里没有写明进度的验收项仍然未实现。
 - **上位决策**：`ADR-001`（独立运行时 / camelCase 线协议 / snake_case 数据库 / persistence 负责映射）
 - **配套**：`DATA-MODEL.md`（列与约束）、`RUNTIME-LIFECYCLE.md`（状态机）、`TRUST-BOUNDARIES.md`（权限域）
 
@@ -147,12 +147,13 @@
 | 概念 | 标识 | 何时变 | 用途 |
 |---|---|---|---|
 | 逻辑任务 | `taskId`（`tasks.id`） | 创建时分配，**整个任务生命周期不变** | 表达"要做的这件事" |
-| 一次运行 | **`runId`** | **每一次实际执行都新分配**（含每一次重试） | 计费、日志、时延、失败归因 |
-| 尝试序号 | `attemptNo`（`tasks.attempt`） | 每次重试 +1 | 表达"第几次尝试" |
+| 一次运行 | **`runId`** | **领取并开始一次实际执行时新分配**（含失败后的下一次重试领取）。运行期间不变。崩溃恢复不分配新 `runId` | 计费、日志、时延、失败归因 |
+| 尝试序号 | `attemptNo`（`tasks.attempt`） | **领取时 +1**。运行期间不变。失败后的重试在下一次重新领取时再 +1。崩溃恢复不加，恢复后仍沿用原 attempt | 表达"第几次尝试" |
 
-- **重试 = 新 run + 同 task**。把重试当作同一次模型调用会导致：计费与用量统计错误、时延分布失真、
+- **重试 = 下一次领取时的新 run + 同 task**。把重试当作同一次模型调用会导致：计费与用量统计错误、时延分布失真、
   失败重试掩盖首次失败、缓存/幂等判断误用同一个键。
-- 生成者：调度器派发任务时 / Model Gateway 实际发起调用时。**生成时机精确到"开始执行"**，不是"计划执行"。
+- 生成者：调度器派发任务时 / Model Gateway 实际发起调用时。**生成时机精确到"开始执行"**，不是"计划执行"。崩溃恢复不是这两个时机。
+- **attempt 的加减以已批准的 D-RT1 为准，此处不另立决议。** Scheduler 领取任务时 `attempt` 加 1，并写入新的 `runId`。任务运行期间 `attempt` 不变。运行失败后的重试，在下一次重新领取时加 `attempt`。崩溃恢复不增加 `attempt`，恢复后仍沿用原 `attempt`。对应代码：persistence 的 `claimNext`（领取时 +1 并写新 `runId`）、`failTask`（未达上限则退回 `queued`，不改 `attempt`）、`recoverRunningTask`（未达上限则退回 `queued`，不改 `attempt`，不改 `run_id`）。Scheduler（SH-008D D3）未开始，Daemon 也不调用恢复。
 - **终止**：单次运行必然终止（成功 / 失败 / 取消 / 超时）。终态后该 `runId` 不再使用。
 - **不得**：把 `runId` 当记忆主体；把 `taskId` 当 `runId`；复用旧 `runId` 表达重试。
 
@@ -341,11 +342,13 @@ persona (psn)
 | `personas` | `id` | personaId | 兼容 |
 | `sessions` | `id` / `external_id` | sessionId / adapter 侧会话引用 | 兼容（`external_id` 即 `externalSessionRef`） |
 | `thought_threads` | `id` | threadId | 兼容 |
-| `tasks` | `id` / `run_id` / `attempt` | taskId / runId / attemptNo | 兼容，需明确"每次 attempt 换 runId" |
-| `events` | `id` | eventId | **需改**（见 §9.2） |
+| `tasks` | `id` / `run_id` / `attempt` | taskId / runId / attemptNo | 列已在 `0001`。D-RT1：领取时 `attempt+1` 并写入新 `runId`；崩溃恢复不加 `attempt`、不换 `runId`。Scheduler 尚未领取 |
+| `events` | `id` / `adapter_id` / `adapter_event_ref` | eventId / 适配器引用 | 列与 `ux_events_dedupe` 已在 `0001`（见 §9.2）。这不表示 Ingress 已挂到 Daemon |
 | `action_records` | `action_id` | actionId | 兼容 |
 
 ### 9.2 必须的数据模型修正
+
+（a）（b）的列和索引已经在 `packages/persistence/migrations/0001_init_core.sql`。下面保留协议要求的形状，不是待办迁移。（c）的审计表不在 P1：`0001` 不创建 Archive 表。
 
 **(a) `events` 主键冲突消解**
 
@@ -493,24 +496,24 @@ CREATE UNIQUE INDEX ux_sessions_external
 |---|---|---|
 | I01 | 六类 ID 格式符合 §3.1 正则，长度恒为 30 | **分配器已测（SH-008A）**：`packages/runtime` 生成的六类 ID 在 CI 中每前缀 10000 个全部通过 contracts 的 `is*` / `parse*`，长度恒为 30。格式正则本身在 SH-004 已有测试 |
 | I02 | 所有 ID 由 Harness 生成；Adapter 提交内部 ID 一律拒绝 | 未实现 |
-| I03 | 相同 `(personaId, adapterId, source, adapterEventRef)` 重投返回同一 `eventId` | 未实现 |
-| I04 | 不同 Adapter 或不同 persona 使用相同 `adapterEventRef` 不冲突 | 未实现 |
-| I05 | 每次重试产生新 `runId`，`taskId` 不变，`attemptNo` 递增 | 未实现 |
+| I03 | 相同 `(personaId, adapterId, source, adapterEventRef)` 重投返回同一 `eventId` | **部分（SH-008C 进程内 Ingress）**：同键再次 `acceptStimulus` 返回既有 `eventId`，不插入第二行（`packages/runtime/test/ingress.test.ts`）。`bodyVerified` 恒为 `false`。无 HTTP，Daemon 未调用。整条验收未通过 |
+| I04 | 不同 Adapter 或不同 persona 使用相同 `adapterEventRef` 不冲突 | **索引已落地，事件用例未测完**：`ux_events_dedupe` 是 `(persona_id, adapter_id, source, adapter_event_ref)`。`ingress.test.ts` 没有用同一 `adapterEventRef` 对两个 persona 或两个 adapter 断言两条事件行。不写成通过 |
+| I05 | 每次重试产生新 `runId`，`taskId` 不变，`attemptNo` 递增 | **部分（SH-008D D1 原语）**：`claimNext` 在领取时 `attempt+1` 并写入新 `runId`，`taskId` 不变。失败退回 `queued` 时不加 `attempt`。崩溃恢复不加 `attempt`、不换 `runId`。Scheduler（D3）未开始，没有运行中的重试派发。整条验收未通过 |
 | I06 | 同一意图的所有重试复用同一 `actionId` | 未实现 |
 | I07 | 无 `actionId` 或 `actionId` 不匹配的回执被拒绝 | 未实现 |
 | I08 | 崩溃恢复后 `executing` 动作不因重启被标记成功 | 未实现 |
 | I09 | 任何记录都可凭 `personaId` 隔离查询，不串人格 | 未实现 |
 | I10 | `requestNonce` 与 `eventId` 在任何路径上不可互换 | 未实现 |
 | I11 | ID 中不含可推断内容的信息（仅时间前缀） | **分配器已满足（SH-008A）**：分配函数不接收内容参数；主体只有 10 字符时间前缀和 16 字符随机段 |
-| I12 | 数据库唯一索引能捕获生成器碰撞并报错而非覆盖 | **部分（SH-008A）**：占用时重试，预算耗尽报 `id_collision`，不返回已占用 ID。`packages/runtime/test/allocator.test.ts` 用真实 SQLite 主键证明冲突行不被覆盖。业务写入路径尚未改用该分配器 |
+| I12 | 数据库唯一索引能捕获生成器碰撞并报错而非覆盖 | **部分（SH-008A，以及已接上分配器的写入）**：占用时重试，预算耗尽报 `id_collision`，不返回已占用 ID。`packages/runtime/test/allocator.test.ts` 用真实 SQLite 主键证明冲突行不被覆盖。人格创建、Ingress 的 `eventId` / `sessionId` 已走该分配器。`allocateThreadId` / `allocateActionId` / `allocateConflictRecordId` 只产生字符串，没有对应业务插入。整条验收未通过 |
 | I13 | `required` 事件同键异内容能被 `archive.compare` 判为 `conflict` | 未实现 |
-| I14 | `excluded` / P1 下同键异内容**不被谎报为已识别**（只幂等命中） | 未实现 |
+| I14 | `excluded` / P1 下同键异内容**不被谎报为已识别**（只幂等命中） | **部分（仅 P1 的进程内 Ingress）**：去重命中时 `bodyVerified` 为 `false`，日志不声称正文一致，第二份正文不进缓冲（`ingress.test.ts`）。`excluded` 策略与 `archive.compare` 都没有。整条验收未通过 |
 | I15 | 审计表（`archive_decisions` / `archive_conflict_records`）均带 `persona_id`，可按人格隔离查询 | 未实现 |
 | I16 | `archive.compare` 只由 Ingress 去重路径调用；未命中去重键时**零**调用 | 未实现 |
 | I17 | `compare` 的判定结果不出现在模型上下文、主观记忆、`events` 任何列与日志正文中 | 未实现 |
 | I18 | 适配器只凭 `adapterEventRef` + `requestNonce` 即可完成重试，**无需**持有内部 `eventId` | 未实现 |
-| I19 | 已终态（`expired` / `rejected`）的事件不被同键重投重开或改写 | 未实现 |
+| I19 | 已终态（`expired` / `rejected`）的事件不被同键重投重开或改写 | **部分（SH-008C 进程内 Ingress）**：同键再投不改写 `expired` / `rejected`（`ingress.test.ts`，`does not reopen an expired or rejected event`）。没有适配器传输层。整条验收未通过 |
 
 ---
 
-**除文中明确写成已实现的部分（SH-004 的格式与 Schema、SH-008A 的分配器）外，本文档不表示身份协议的运行时行为已经完成。**
+**除文中写成已实现或「部分」的那一层以外，本文档不表示身份协议的运行时行为已经完成。** 进程内 Ingress 与任务领取 / 恢复原语都不是 Daemon 上已经接通的身份路径。

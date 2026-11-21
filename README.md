@@ -13,21 +13,20 @@ DSH / Minecraft / QQ / CLI 都是**可选适配器**；不安装它们，Daemon 
 **P0：架构冻结与工程规范。** 文档主体已完成；`packages/contracts` 已落地（SH-004）；
 Monorepo 根工程化已完成（SH-005）。
 
-**P1 进行中。** `packages/persistence` 已完成（SH-006A–D）；`apps/soul-daemon` 的生命周期与
-装配层已完成（SH-007A）。`packages/runtime` 的 ID 分配器（SH-008A）与进程内 Persona 生命周期（SH-008B）已完成。
-**事件总线、调度器、扫描 A/B、检查点编排、API/WebSocket 仍未实现。Daemon 尚未装配 Runtime。**
+**P1 进行中。** `packages/persistence` 的 SH-006A–D 已完成；其后还有已合并的 SH-008P、SH-008C 存储原语和 SH-008D D1 任务状态机，这些不另计为 SH-006 的再次验收。`apps/soul-daemon` 的生命周期与装配层已完成（SH-007A）。`packages/runtime` 已有 ID 分配器（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）和 P1 `recoverRuntime`（SH-008D D2，代码已提交，无独立审查通过或批次验收记录）。
+**调度器（D3）、扫描 A/B、检查点编排、API/WebSocket 仍未实现。Daemon 尚未装配 Runtime：启动不会调用人格归一、`recoverRuntime` 或 Ingress。SH-008E 未开始。**
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 主计划、ADR、信任边界、数据模型、生命周期、模块边界、身份协议、协作规范 | 文档主体已完成（SH-001 → SH-003.2）；**`packages/contracts` 已实现（SH-004）** |
-| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo 骨架（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期与装配（SH-007A）**、**Runtime ID 分配器（SH-008A）**、**进程内 Persona 生命周期（SH-008B）** 已完成；SH-008C–E 与 API / WebSocket 未开始 |
+| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo 骨架（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期与装配（SH-007A）** 已完成。Runtime 包内：SH-008A / SH-008B 维持「代码层面已交付」；SH-008C 代码已合并；SH-008D 只有 D1、D2 的代码，D3 / D4 未开始，整批未验收。SH-008E 与 API / WebSocket 未开始 |
 | P2+ | 事件接入、记忆网络、激活、自主认知、遗忘、睡眠梦境、外部适配 | 未开始 |
 
 目录和文档存在**不代表**功能完成。任何"已实现"必须以测试与验收记录为凭。
-目前满足该标准的是 `packages/contracts`（SH-004）、`packages/persistence`（SH-006A–D）、
+目前按当时记录交付的是 `packages/contracts`（SH-004）、`packages/persistence` 的 SH-006A–D、
 `apps/soul-daemon` 的生命周期装配（SH-007A），以及 `packages/runtime` 的 ID 分配器（SH-008A）
-与进程内 Persona 生命周期（SH-008B）。
-这些都不是认知 Runtime。
+与进程内 Persona 生命周期（SH-008B）。SH-008C 与 SH-008D D1/D2 的代码已在 main，仓库里没有它们的独立审查通过或批次验收记录。
+这些都不是认知 Runtime，Daemon 也还没有接上它们。
 
 ## 文档入口
 
@@ -54,7 +53,7 @@ Monorepo 根工程化已完成（SH-005）。
 ├─ packages/
 │  ├─ contracts/              # 协议契约包（SH-004，零运行时依赖）
 │  ├─ persistence/            # SQLite 持久化（SH-006A–D）
-│  └─ runtime/                # ID 分配器（SH-008A）与进程内 Persona 生命周期（SH-008B）。尚无事件总线、调度器、检查点编排
+│  └─ runtime/                # ID 分配（SH-008A）、Persona 生命周期（SH-008B）、进程内 Ingress（SH-008C）、P1 recoverRuntime（SH-008D D2）。无调度器、无检查点编排；Daemon 未装配
 ├─ tools/consumer-check/      # 跨包导入验证：按包名导入 ESM + d.ts
 ├─ docs/                      # 架构文档（唯一基线）
 ├─ .github/workflows/ci.yml   # CI：format / lint / typecheck / test / build / consumer
@@ -71,9 +70,9 @@ Monorepo 根工程化已完成（SH-005）。
 | 包 | 内容 | 状态 |
 |---|---|---|
 | [packages/contracts](packages/contracts/README.md) | 协议类型、10 份已注册 JSON Schema、枚举与标识符格式；双层信封（适配器输入层 / Ingress 归一化层）、零运行时依赖、无 IO、不生成 ID | **已实现（协议层，SH-004）**，含测试与正反 fixtures |
-| [packages/persistence](packages/persistence/README.md) | SQLite（WAL、单写入者）、Migration、事务协调器、六表 Repository、字段映射、Runtime checkpoint envelope 存取 | **已完成（SH-006A–D）**。不重建 Runtime；无显式 `PRAGMA wal_checkpoint` |
-| [packages/runtime](packages/runtime/README.md) | 六类核心 ID 与辅助 ID（`tsk` / `cnf`）分配；进程内 Persona 生命周期。无裸 SQL | **SH-008A / SH-008B 已完成**。事件总线、调度器、扫描 A/B、检查点编排未实现；Daemon 未装配 |
-| [apps/soul-daemon](apps/soul-daemon/README.md) | 配置、结构化日志、数据目录、单实例锁、打开 SQLite、Migration、启停状态机 | **已完成（SH-007A）**。Persona / Runtime 恢复、Event Bus、Scheduler、API 未实现 |
+| [packages/persistence](packages/persistence/README.md) | SQLite（WAL、单写入者）、Migration、事务协调器、六表 Repository、字段映射、Runtime checkpoint envelope 存取；其后另有 SH-008P / SH-008C 存储原语与 SH-008D D1 任务状态机 | **SH-006A–D 已完成**。后续提交不另计为 SH-006 验收。不重建 Runtime；无显式 `PRAGMA wal_checkpoint` |
+| [packages/runtime](packages/runtime/README.md) | 六类核心 ID 与辅助 ID（`tsk` / `cnf`）分配；进程内 Persona 生命周期；进程内 P1 Ingress；P1 `recoverRuntime`。无裸 SQL | **A / B：代码层面已交付。C：代码已合并。D2：代码提交至 D2.R4，审查与批次验收均无通过记录。** 无调度器、无扫描 A/B、无检查点编排。Daemon 未装配 |
+| [apps/soul-daemon](apps/soul-daemon/README.md) | 配置、结构化日志、数据目录、单实例锁、打开 SQLite、Migration、启停状态机 | **已完成（SH-007A）**。不调用 Persona Recovery、Runtime Recovery、Event Bus 或 Scheduler。API 未实现 |
 
 ## 旧系统
 

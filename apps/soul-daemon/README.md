@@ -4,7 +4,7 @@
   `packages/`（[MODULES](../../docs/architecture/MODULES.md) §4）。
 - **状态**：**SH-007A 已完成**——配置、结构化日志、数据目录检查、单实例锁、打开 SQLite、
   执行 Migration、启动/关闭状态机与资源逆序释放。
-  **Daemon 仍未装配 Runtime。** `packages/runtime` 目前只有 ID 分配器（SH-008A）；事件总线、Scheduler、HTTP/WebSocket、健康检查尚未实现（SH-008B–E / SH-009）。
+  **Daemon 仍未装配 Runtime。** `packages/runtime` 里已有 ID 分配器（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）和 P1 `recoverRuntime`（SH-008D D2，代码已提交）。本进程不调用它们。Scheduler（SH-008D D3）没有开始。把 Persona Recovery、Runtime Recovery、Event Bus、Scheduler 接到本进程属于 SH-008E，未开始。HTTP/WebSocket、健康检查属于 SH-009，未开始。
   SH-007B 不是下一批代码：它依赖 SH-008 与 SH-009 的真实组件接入，之后才验收 Daemon 的启动、就绪、关闭、资源释放与失败处理，自身不单独实施代码。
 - **上位文档**：[RUNTIME-LIFECYCLE](../../docs/architecture/RUNTIME-LIFECYCLE.md) §2/§3/§4/§9、
   [PLAN](../../docs/PLAN.md) §6/§7、[MODULES](../../docs/architecture/MODULES.md) §1/§4。
@@ -36,8 +36,8 @@ BOOTING → MIGRATING → RECOVERING → READY → RUNNING
 |---|---|---|
 | BOOTING | 配置校验、日志、数据目录探测、**单实例锁**、打开 Store | — |
 | MIGRATING | `migrate()` + `verifySchema()` | — |
-| RECOVERING | 仅记录阶段与跳过原因 | Persona 恢复、Runtime 恢复（SH-008） |
-| READY | 仅记录阶段与跳过原因 | Event Bus、Scheduler（SH-008）、API/WS、健康检查（SH-009） |
+| RECOVERING | 仅记录阶段与跳过原因 | Persona 恢复、Runtime 恢复。包内已有对应函数，本进程不调用；装配是 SH-008E，未开始 |
+| READY | 仅记录阶段与跳过原因 | Event Bus（包内 Ingress 存在，本进程不挂接；装配是 SH-008E）、Scheduler（D3 未开始）、API/WS、健康检查（SH-009） |
 | RUNNING | 进程持有数据库与锁，等待停止信号 | 认知循环（SH-008 起） |
 
 关闭（§3）：
@@ -144,15 +144,16 @@ SOUL_DATA_DIR=/var/lib/soul node apps/soul-daemon/dist/main.js     # 前台运�
 
 | 能力 | 归属 |
 |---|---|
-| Persona / Runtime 恢复（Runtime checkpoint、队列、活跃思维） | SH-008 |
-| 事件总线、Scheduler | SH-008 |
+| 在本进程的 `RECOVERING` 调用 Persona 归一与 `recoverRuntime` | SH-008E（未开始）。包内函数已经存在，本表说的是 Daemon 没有接上。检查点、队列、活跃思维的恢复仍然没有 |
+| 在本进程初始化 Event Bus | SH-008E（未开始）。进程内 Ingress 在 `packages/runtime`，本进程不挂接 |
+| Scheduler | 包内实现是 SH-008D D3（未开始）；接到本进程还要等 SH-008E |
 | HTTP / WebSocket API、健康检查端点 | SH-009 |
-| Runtime checkpoint 写入（当前阶段无合法 checkpoint 可写） | SH-008 |
+| Runtime checkpoint 写入（当前阶段无合法 checkpoint 可写） | 仍未实现。不在已提交的 `recoverRuntime` 里 |
 | 显式 `PRAGMA wal_checkpoint` | 未实现。关闭只调用 `DatabaseSync.close()`，SQLite 可能自动 checkpoint，但应用层没有显式语句 |
 | 进程级锁之外的并发控制 | 后续 |
 | 结构化日志文件轮转/落盘 | 后续 |
 
-SH-007A 已完成。上表归属不因 SH-007B 改变：Persona Recovery、Runtime Recovery、Event Bus、Scheduler 仍是 SH-008；HTTP API、WebSocket、健康检查仍是 SH-009。SH-007B 不插在它们前面单独写代码。
+SH-007A 已完成。上表归属不因 SH-007B 改变：Persona Recovery、Runtime Recovery、Event Bus、Scheduler 的 **Daemon 装配**仍是 SH-008E；Scheduler 本身是 SH-008D D3。二者都未开始。HTTP API、WebSocket、健康检查仍是 SH-009。SH-007B 不插在它们前面单独写代码。
 
 ## 8. 测试
 
