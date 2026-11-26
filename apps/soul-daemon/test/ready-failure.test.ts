@@ -369,6 +369,9 @@ describe('READY failure paths', () => {
     expect(daemon.status.lockHeld).toBe(true);
     expect(daemon.phase).toBe('DRAINING');
 
+    for (let attempt = 0; attempt < 200 && control.releaseStop === null; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
     const release = control.releaseStop;
     if (release === null) {
       throw new Error('stop gate was not installed');
@@ -450,6 +453,9 @@ describe('READY failure paths', () => {
     expect(daemon.status.storeOpen).toBe(true);
     expect(daemon.status.lockHeld).toBe(true);
 
+    for (let attempt = 0; attempt < 200 && control.releaseStop === null; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
     const release = control.releaseStop;
     if (release === null) {
       throw new Error('stop gate was not installed');
