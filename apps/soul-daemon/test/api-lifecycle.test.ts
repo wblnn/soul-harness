@@ -71,6 +71,55 @@ describe('API lifecycle', () => {
     await expect(fetch('http://127.0.0.1:18700/v1/health/live')).rejects.toBeTruthy();
   }, 15_000);
 
+  it('drains a WebSocket before releasing Store and Lock', async () => {
+    const dir = tempDir();
+    const daemon = makeDaemon(dir);
+    await daemon.start();
+    const token = apiToken(dir);
+    const socket = new WebSocket('ws://127.0.0.1:18700/v1/ws', ['soul.ws.v1']);
+    const messages: unknown[] = [];
+    socket.addEventListener('message', (event) => {
+      messages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.addEventListener('open', () => resolve(), { once: true });
+      socket.addEventListener('error', () => reject(new Error('websocket open failed')), {
+        once: true,
+      });
+    });
+    const initial = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('initial snapshot timeout')), 2000);
+      const check = (): void => {
+        if (messages.length >= 2) {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      socket.addEventListener('message', check);
+      check();
+    });
+    socket.send(JSON.stringify({ type: 'auth', token }));
+    await initial;
+    expect(messages.slice(0, 2)).toEqual([
+      expect.objectContaining({ type: 'hello', protocol: 'soul.ws.v1' }),
+      expect.objectContaining({ type: 'snapshot' }),
+    ]);
+
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      socket.addEventListener(
+        'close',
+        (event) => resolve({ code: event.code, reason: event.reason }),
+        { once: true },
+      );
+    });
+    await daemon.stop('api-ws-lifecycle');
+    expect(await closed).toStrictEqual({ code: 1001, reason: 'daemon_stop' });
+    expect(messages).toContainEqual({ type: 'shutting_down', reason: 'daemon_stop' });
+    expect(daemon.status.storeOpen).toBe(false);
+    expect(daemon.status.lockHeld).toBe(false);
+    expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+  }, 20_000);
+
   it('fails closed when the fixed port is already occupied', async () => {
     const blocker = createServer();
     await new Promise<void>((resolve, reject) => {

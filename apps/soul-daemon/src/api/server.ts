@@ -7,10 +7,13 @@
  * not part of the operational log stream.
  */
 
+import type { IncomingMessage } from 'node:http';
+
 import Fastify, { type FastifyInstance } from 'fastify';
+import websocket from '@fastify/websocket';
 
 import { DaemonError } from '../errors.js';
-import { ApiError } from './errors.js';
+import { ApiError, apiErrorEnvelope } from './errors.js';
 import type { DaemonApi } from './daemon-api.js';
 import type { ApiTokenVerifier } from './token.js';
 import type { Readiness } from './wire.js';
@@ -19,6 +22,8 @@ import { assertBearer } from './http/auth.js';
 import { sendHttpError } from './http/errors.js';
 import { applyCors, assertHost, assertOrigin } from './http/host-origin.js';
 import { TokenBucket } from './http/limits.js';
+import { WebSocketHub } from './ws.js';
+import { hasSubprotocol, WS_MAX_FRAME_BYTES, WS_SUBPROTOCOL } from './ws-protocol.js';
 import { registerEventReadRoutes } from './routes/events-read.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerPersonaReadRoutes } from './routes/personas-read.js';
@@ -51,6 +56,7 @@ export interface LocalApiServerOptions {
 
 interface ServerRuntime {
   readonly app: FastifyInstance;
+  readonly hub: WebSocketHub;
 }
 
 function createApp(options: LocalApiServerOptions, getState: () => LocalApiState): ServerRuntime {
@@ -67,8 +73,66 @@ function createApp(options: LocalApiServerOptions, getState: () => LocalApiState
   const bucket = new TokenBucket({
     ...(options.clock === undefined ? {} : { clock: options.clock }),
   });
+  const hub = new WebSocketHub({ api: options.api, token: options.token });
+
+  app.register(websocket, {
+    options: {
+      maxPayload: WS_MAX_FRAME_BYTES,
+      handleProtocols: (protocols: Set<string>) =>
+        protocols.has(WS_SUBPROTOCOL) ? WS_SUBPROTOCOL : false,
+      verifyClient: (
+        info: { readonly req: IncomingMessage; readonly origin?: string },
+        next: (
+          accepted: boolean,
+          code?: number,
+          message?: string,
+          headers?: Record<string, string>,
+        ) => void,
+      ): void => {
+        const reject = (code: number, error: ApiError): void => {
+          next(false, code, JSON.stringify(apiErrorEnvelope(error)), {
+            'Content-Type': 'application/json',
+          });
+        };
+        try {
+          assertHost(info.req.headers.host);
+          assertOrigin(info.req.headers.origin);
+        } catch {
+          reject(403, new ApiError('forbidden'));
+          return;
+        }
+        if (!bucket.take()) {
+          reject(429, new ApiError('rate_limited'));
+          return;
+        }
+        if (info.req.url?.includes('?')) {
+          reject(400, new ApiError('invalid_request'));
+          return;
+        }
+        if (!hasSubprotocol(info.req.headers['sec-websocket-protocol'])) {
+          reject(426, new ApiError('invalid_request'));
+          return;
+        }
+        if (!hub.reserve(info.req)) {
+          reject(503, new ApiError('unavailable'));
+          return;
+        }
+        next(true);
+      },
+    },
+  });
+  app.after(() => {
+    hub.register(app);
+  });
 
   app.addHook('onRequest', async (request, reply) => {
+    // Upgrade validation and reservation happen in the websocket transport's
+    // verifyClient hook, before handleUpgrade. A normal HTTP GET to this path
+    // still falls through to the management Bearer check.
+    if (hub.isUpgrade(request)) {
+      return;
+    }
+
     assertHost(request.headers.host);
     const origin = assertOrigin(request.headers.origin);
     applyCors(reply, origin);
@@ -89,6 +153,10 @@ function createApp(options: LocalApiServerOptions, getState: () => LocalApiState
       }
       assertBearer(request.headers.authorization, options.token);
     }
+  });
+
+  app.addHook('onResponse', async (request) => {
+    hub.releasePending(request.raw);
   });
 
   app.setErrorHandler((error, request, reply) => sendHttpError(error, request, reply));
@@ -113,7 +181,7 @@ function createApp(options: LocalApiServerOptions, getState: () => LocalApiState
   registerTaskReadRoutes(app, options.api);
   registerSessionReadRoutes(app, options.api);
 
-  return { app };
+  return { app, hub };
 }
 
 export function createLocalApiServer(options: LocalApiServerOptions): LocalApiServer {
@@ -153,6 +221,7 @@ export function createLocalApiServer(options: LocalApiServerOptions): LocalApiSe
     async beginDrain(): Promise<void> {
       if (state === 'running' || state === 'assembled') {
         state = 'draining';
+        await runtime.hub.beginDrain();
         return;
       }
       if (state === 'draining') {
@@ -166,6 +235,7 @@ export function createLocalApiServer(options: LocalApiServerOptions): LocalApiSe
         return;
       }
       try {
+        await runtime.hub.close();
         await runtime.app.close();
         closed = true;
         state = 'stopped';

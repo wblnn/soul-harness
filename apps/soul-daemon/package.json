@@ -31,6 +31,7 @@
     "check": "tsc -p tsconfig.json --noEmit && vitest run"
   },
   "dependencies": {
+    "@fastify/websocket": "11.3.7",
     "@soul-harness/persistence": "workspace:*",
     "@soul-harness/runtime": "workspace:*",
     "fastify": "5.12.8"
