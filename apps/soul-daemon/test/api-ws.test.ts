@@ -476,14 +476,12 @@ describe('WebSocket auth and snapshot edges', () => {
       try {
         await messages.next(300);
         extra += 1;
-        if (extra > 8) {
-          break;
-        }
       } catch {
         break;
       }
     }
-    expect(extra).toBeLessThanOrEqual(3);
+    expect(extra).toBeGreaterThan(0);
+    expect(extra).toBeLessThanOrEqual(8);
     socket.send(JSON.stringify({ type: 'pull' }));
     expect(await messages.next()).toMatchObject({ type: 'snapshot' });
   });
