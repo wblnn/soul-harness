@@ -269,6 +269,31 @@ describe('structured logging', () => {
     expect(lines[0]).not.toContain('amber-otter');
   });
 
+  it('allows API token error codes while redacting token material and paths', () => {
+    const codes = ['api_token_invalid', 'api_token_insecure', 'api_token_io_failed'] as const;
+    const secret = 'DO_NOT_LOG_API_TOKEN_9f3e2a7c';
+    const path = '/private/should-not-leak/api.token';
+    for (const code of codes) {
+      const { lines, logger } = capture();
+      logger.error('fatal', {
+        code,
+        token: secret,
+        authorization: `Bearer ${secret}`,
+        filePath: path,
+        message: `failed at ${path}`,
+      });
+      const line = lines[0] as string;
+      const record = JSON.parse(line) as Record<string, unknown>;
+      expect(record['code']).toBe(code);
+      expect(record['token']).toBeUndefined();
+      expect(record['authorization']).toBeUndefined();
+      expect(record['filePath']).toBeUndefined();
+      expect(record['message']).toBeUndefined();
+      expect(line).not.toContain(secret);
+      expect(line).not.toContain(path);
+    }
+  });
+
   it('drops an unknown field name instead of publishing it', () => {
     const phrase = 'secret-user-email-alice@example.com';
     const { lines, logger } = capture();

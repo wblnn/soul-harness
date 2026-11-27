@@ -215,6 +215,9 @@ const ALLOWED_EVENTS: ReadonlySet<string> = new Set([
  * `clock_failed` are the scheduler's own synthetic codes, not caller text.
  */
 const ALLOWED_CODES: ReadonlySet<string> = new Set([
+  'api_token_invalid',
+  'api_token_insecure',
+  'api_token_io_failed',
   'async_callback_unsupported',
   'check_violation',
   'checkpoint_epoch_mismatch',

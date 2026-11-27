@@ -28,6 +28,9 @@ export const DAEMON_ENTRY = join(APP_ROOT, 'dist', 'main.js');
 
 export const SIGNAL_RUNNER = join(APP_ROOT, 'test', 'fixtures', 'signal-runner.mjs');
 
+/** Marker-controlled fixture for tests that need to connect before SIGTERM. */
+export const MARKER_SIGNAL_RUNNER = join(APP_ROOT, 'test', 'fixtures', 'marker-signal-runner.mjs');
+
 /** Required task policy. Production config has no default for these two. */
 export const TEST_POLICY_ENV: Record<string, string> = {
   SOUL_TASK_MAX_ATTEMPTS: '3',

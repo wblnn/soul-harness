@@ -1,11 +1,13 @@
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { request } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 
 import { LOCK_FILE_NAME } from '../src/lock.js';
 import {
+  MARKER_SIGNAL_RUNNER,
   SIGNAL_RUNNER,
   buildDaemonApp,
   makeTempDir,
@@ -18,20 +20,32 @@ import {
   prepareDatabase,
   readTask,
   seedPersona,
+  seedEvent,
   seedQueuedTask,
   seedRunningTask,
+  readEvent,
 } from './helpers/recovery-seed.js';
 
 const dirs: string[] = [];
 const daemons: SpawnedDaemon[] = [];
+const wsClients: WebSocket[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  while (wsClients.length > 0) {
+    const socket = wsClients.pop() as WebSocket;
+    try {
+      socket.close();
+    } catch {
+      // Already closed.
+    }
+  }
   while (daemons.length > 0) {
     const daemon = daemons.pop() as SpawnedDaemon;
     const child: ChildProcess = daemon.child;
     if (child.exitCode === null) {
       child.kill('SIGKILL');
     }
+    await daemon.waitForExit(5000).catch(() => undefined);
   }
   while (dirs.length > 0) {
     removeTempDir(dirs.pop() as string);
@@ -66,6 +80,141 @@ function openedDatabase(spawned: SpawnedDaemon): boolean {
   );
 }
 
+interface HttpResult {
+  readonly statusCode: number;
+  readonly headers: Record<string, string | string[] | undefined>;
+  readonly body: string;
+}
+
+function httpRequest(options: {
+  readonly method?: string;
+  readonly path: string;
+  readonly headers?: Record<string, string>;
+  readonly body?: string | Buffer;
+}): Promise<HttpResult> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      {
+        host: '127.0.0.1',
+        port: 18700,
+        method: options.method ?? 'GET',
+        path: options.path,
+        headers: {
+          Host: '127.0.0.1:18700',
+          ...options.headers,
+        },
+      },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          body += chunk;
+        });
+        response.on('end', () => {
+          resolve({
+            statusCode: response.statusCode ?? 0,
+            headers: response.headers,
+            body,
+          });
+        });
+      },
+    );
+    req.once('error', reject);
+    if (options.body !== undefined) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
+function readApiToken(dir: string): string {
+  const token = readFileSync(join(dir, 'api.token'), 'utf8').replace(/\r?\n$/u, '');
+  expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  return token;
+}
+
+function eventCount(dir: string): number {
+  const db = new DatabaseSync(join(dir, 'soul.db'));
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS count FROM events').get() as
+      { count: number } | undefined;
+    return row?.count ?? 0;
+  } finally {
+    db.close();
+  }
+}
+
+interface MessageQueue {
+  next(timeoutMs?: number): Promise<unknown>;
+}
+
+function collectWebSocket(socket: WebSocket): MessageQueue {
+  const messages: unknown[] = [];
+  const waiters: Array<{
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: Error) => void;
+    readonly timer: ReturnType<typeof setTimeout>;
+  }> = [];
+  socket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data)) as unknown;
+    const waiter = waiters.shift();
+    if (waiter === undefined) {
+      messages.push(message);
+      return;
+    }
+    clearTimeout(waiter.timer);
+    waiter.resolve(message);
+  });
+  return {
+    next(timeoutMs = 3000): Promise<unknown> {
+      if (messages.length > 0) {
+        return Promise.resolve(messages.shift());
+      }
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          resolve,
+          reject,
+          timer: setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) {
+              waiters.splice(index, 1);
+            }
+            reject(new Error('websocket message timeout'));
+          }, timeoutMs),
+        };
+        waiters.push(waiter);
+      });
+    },
+  };
+}
+
+function openWebSocket(): Promise<WebSocket> {
+  const socket = new WebSocket('ws://127.0.0.1:18700/v1/ws', ['soul.ws.v1']);
+  wsClients.push(socket);
+  return new Promise((resolve, reject) => {
+    socket.addEventListener('open', () => resolve(socket), { once: true });
+    socket.addEventListener('error', () => reject(new Error('websocket open failed')), {
+      once: true,
+    });
+  });
+}
+
+function waitForWebSocketClose(
+  socket: WebSocket,
+  timeoutMs = 5000,
+): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('websocket close timeout')), timeoutMs);
+    socket.addEventListener(
+      'close',
+      (event) => {
+        clearTimeout(timer);
+        resolve({ code: event.code, reason: event.reason });
+      },
+      { once: true },
+    );
+  });
+}
 /**
  * Remembers `close` so a race can see the loser exit without waiting for a
  * `RUNNING` log that will never arrive. The listener is attached before the
@@ -300,10 +449,11 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       const firstDir = tempDir();
       const secondDir = tempDir();
       const first = spawnDaemon({ env: { SOUL_DATA_DIR: firstDir } });
+      daemons.push(first);
       await first.waitFor((record) => isPhase(record, 'RUNNING'));
 
       const second = spawnDaemon({ env: { SOUL_DATA_DIR: secondDir } });
-      daemons.push(first, second);
+      daemons.push(second);
 
       const code = await second.waitForExit();
       expect(code).toBe(5);
@@ -342,18 +492,205 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
   );
 
   it(
+    'serves real HTTP and WebSocket, then drains on the marker SIGTERM',
+    async () => {
+      const dir = tempDir();
+      const marker = join(dir, 'ready.marker');
+      const spawned = spawnDaemon({
+        env: {
+          SOUL_DATA_DIR: dir,
+          SOUL_TEST_SIGNAL_MARKER: marker,
+        },
+        entry: MARKER_SIGNAL_RUNNER,
+      });
+      daemons.push(spawned);
+      await spawned.waitFor((record) => isPhase(record, 'RUNNING'));
+
+      const token = readApiToken(dir);
+      const auth = { Authorization: `Bearer ${token}` };
+      expect(statSync(join(dir, 'api.token')).size).toBe(44);
+      if (process.platform !== 'win32') {
+        expect(statSync(join(dir, 'api.token')).mode & 0o7777).toBe(0o600);
+      }
+
+      const live = await httpRequest({ path: '/v1/health/live' });
+      const ready = await httpRequest({ path: '/v1/health/ready' });
+      expect(live.statusCode).toBe(200);
+      expect(JSON.parse(live.body)).toStrictEqual({ status: 'ok' });
+      expect(ready.statusCode).toBe(200);
+      expect(JSON.parse(ready.body)).toStrictEqual({ status: 'ready' });
+
+      const noAuth = await httpRequest({ path: '/v1/status' });
+      const wrongAuth = await httpRequest({
+        path: '/v1/status',
+        headers: { Authorization: 'Bearer wrong' },
+      });
+      const status = await httpRequest({ path: '/v1/status', headers: auth });
+      expect(noAuth.statusCode).toBe(401);
+      expect(wrongAuth.statusCode).toBe(401);
+      expect(status.statusCode).toBe(200);
+      expect(status.body).not.toContain(token);
+      expect(status.body).not.toContain('dataDir');
+      expect(status.body).not.toContain('databaseFile');
+      expect(status.body).not.toContain('lockPath');
+
+      const badHost = await httpRequest({
+        path: '/v1/status',
+        headers: { ...auth, Host: 'evil.example' },
+      });
+      const badOrigin = await httpRequest({
+        path: '/v1/status',
+        headers: { ...auth, Origin: 'https://evil.example' },
+      });
+      const allowedOrigin = 'http://127.0.0.1:18701';
+      const cors = await httpRequest({
+        path: '/v1/status',
+        headers: { ...auth, Origin: allowedOrigin },
+      });
+      expect(badHost.statusCode).toBe(403);
+      expect(badOrigin.statusCode).toBe(403);
+      expect(cors.statusCode).toBe(200);
+      expect(cors.headers['access-control-allow-origin']).toBe(allowedOrigin);
+      expect(cors.headers['access-control-allow-origin']).not.toBe('*');
+      expect(cors.headers['access-control-allow-credentials']).toBeUndefined();
+      expect(cors.headers['set-cookie']).toBeUndefined();
+
+      const displayName = 'E5A_SECRET_DISPLAY_NAME';
+      const created = await httpRequest({
+        method: 'POST',
+        path: '/v1/personas',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ displayName }),
+      });
+      expect(created.statusCode).toBe(201);
+      const createdBody = JSON.parse(created.body) as { persona: { id: string } };
+      const personaId = createdBody.persona.id;
+      const listed = await httpRequest({ path: '/v1/personas', headers: auth });
+      const one = await httpRequest({ path: `/v1/personas/${personaId}`, headers: auth });
+      expect(listed.statusCode).toBe(200);
+      expect(JSON.parse(listed.body)).toMatchObject({
+        personas: [expect.objectContaining({ id: personaId })],
+      });
+      expect(one.statusCode).toBe(200);
+      expect(JSON.parse(one.body)).toStrictEqual({ persona: createdBody.persona });
+
+      const oversizedBody = JSON.stringify({ displayName: 'x'.repeat(70_000) });
+      const oversized = await httpRequest({
+        method: 'POST',
+        path: '/v1/personas',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: oversizedBody,
+      });
+      expect(oversized.statusCode).toBe(413);
+      expect(JSON.parse(oversized.body)).toStrictEqual({
+        error: { code: 'too_large', message: 'request body too large' },
+      });
+      expect(oversized.body).not.toContain('dataDir');
+
+      const unauth = await openWebSocket();
+      let unauthMessages = 0;
+      unauth.addEventListener('message', () => {
+        unauthMessages += 1;
+      });
+      const unauthClose = waitForWebSocketClose(unauth);
+      unauth.send(JSON.stringify({ type: 'pull' }));
+      expect(await unauthClose).toMatchObject({ code: 1008, reason: 'unauthorized' });
+      expect(unauthMessages).toBe(0);
+
+      const socket = await openWebSocket();
+      const messages = collectWebSocket(socket);
+      socket.send(JSON.stringify({ type: 'auth', token }));
+      expect(await messages.next()).toMatchObject({
+        type: 'hello',
+        protocol: 'soul.ws.v1',
+      });
+      expect(await messages.next()).toMatchObject({ type: 'snapshot' });
+      socket.send(JSON.stringify({ type: 'pull' }));
+      expect(await messages.next()).toMatchObject({ type: 'snapshot' });
+
+      const closePromise = waitForWebSocketClose(socket);
+      const shuttingDown = messages.next();
+      writeFileSync(marker, 'ready');
+      expect(await shuttingDown).toStrictEqual({
+        type: 'shutting_down',
+        reason: 'daemon_stop',
+      });
+      expect(await closePromise).toStrictEqual({ code: 1001, reason: 'daemon_stop' });
+
+      const code = await spawned.waitForExit();
+      expect(code).toBe(0);
+      expect(spawned.records.some((record) => record['event'] === 'signal_received')).toBe(true);
+      const stoppedAt = spawned.records.findIndex(
+        (record) => record['event'] === 'scheduler_stopped',
+      );
+      const daemonStoppedAt = spawned.records.findIndex(
+        (record) => record['event'] === 'daemon_stopped',
+      );
+      expect(stoppedAt).toBeGreaterThanOrEqual(0);
+      expect(daemonStoppedAt).toBeGreaterThan(stoppedAt);
+      expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+      expect(existsSync(join(dir, 'soul.db'))).toBe(true);
+      assertDatabaseIntact(dir);
+      await expect(httpRequest({ path: '/v1/health/live' })).rejects.toBeTruthy();
+
+      const logs = JSON.stringify(spawned.records) + spawned.stderr.join('');
+      expect(logs).not.toContain(token);
+      expect(logs).not.toContain('Authorization');
+      expect(logs).not.toContain('Bearer');
+      expect(logs).not.toContain(displayName);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    'fails real startup with an invalid token and preserves the file',
+    async () => {
+      const dir = tempDir();
+      const invalidToken = 'E5A_INVALID_TOKEN_DO_NOT_LOG';
+      const path = join(dir, 'api.token');
+      writeFileSync(path, `${invalidToken}\n`, { encoding: 'utf8', mode: 0o600 });
+      if (process.platform !== 'win32') {
+        chmodSync(path, 0o600);
+      }
+
+      const spawned = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
+      daemons.push(spawned);
+      const code = await spawned.waitForExit();
+      expect(code).toBe(5);
+      expect(spawned.records.some((record) => record['code'] === 'api_token_invalid')).toBe(true);
+      expect(
+        spawned.records.some(
+          (record) => record['event'] === 'step_ok' && record['step'] === 'sqlite_open',
+        ),
+      ).toBe(false);
+      expect(spawned.records.some((record) => isPhase(record, 'RUNNING'))).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(`${invalidToken}\n`);
+      expect(existsSync(join(dir, LOCK_FILE_NAME))).toBe(false);
+      const logs = JSON.stringify(spawned.records) + spawned.stderr.join('');
+      expect(logs).not.toContain(invalidToken);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
     'survives SIGKILL: the database stays intact and the next start keeps the task row',
     async () => {
       const dir = tempDir();
       prepareDatabase(dir, (store) => {
         seedPersona(store, 1);
         seedQueuedTask(store, 1);
+        seedEvent(store, 1, 1, 'received');
       });
       const before = readTask(dir, 1);
+      const eventsBefore = eventCount(dir);
 
       const crashed = spawnDaemon({ env: { SOUL_DATA_DIR: dir } });
       daemons.push(crashed);
       await crashed.waitFor((record) => isPhase(record, 'RUNNING'));
+
+      const token = readApiToken(dir);
+      assertDatabaseIntact(dir);
+      expect(eventCount(dir)).toBe(eventsBefore);
 
       crashed.child.kill('SIGKILL');
       const crashCode = await crashed.waitForExit();
@@ -377,6 +714,14 @@ describe('real process lifecycle', { timeout: TEST_TIMEOUT }, () => {
       >;
       expect(lock['pid']).toBe(restarted.child.pid);
       expect(restarted.records.some((record) => record['event'] === 'daemon_running')).toBe(true);
+      expect(readApiToken(dir)).toBe(token);
+      const status = await httpRequest({
+        path: '/v1/status',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      expect(status.statusCode).toBe(200);
+      expect(eventCount(dir)).toBe(eventsBefore);
+      expect(readEvent(dir, 1)).not.toBeNull();
       expect(readTask(dir, 1)).toMatchObject({
         state: 'queued',
         attempt: 0,
