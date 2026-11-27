@@ -74,6 +74,8 @@
 > | 5 | `Store.close()`；失败时不释放 Lock |
 > | 6 | `Lock.release()` |
 >
+> **API Drain 失败分支（与 API close sticky failure 不同）**：`#beginApiDrain()` 失败时记录 `http_api` 失败并返回失败结果；`#shutdown()` 随即以 `shutdown_failed` 拒绝关闭。本次关闭流程停在 API Drain 阶段，**不继续执行** `Ingress.close()`、`Scheduler.stop()`、`API.close()`；Store 与 Instance Lock 均不释放。`API.close()` 失败则是另一条路径：它发生在 Scheduler 停止之后、进入 `CLOSING` 之前，并触发 sticky failure。两者不得合并描述。
+>
 > `checkpoint_skipped` 跳过的是 Runtime checkpoint（`runtime_state.checkpoint_json` 的队列游标、活跃线程与 epoch），不是 SQLite WAL checkpoint。应用层没有显式 `PRAGMA wal_checkpoint`；`DatabaseSync.close()` 可能触发默认自动 checkpoint。遗忘事务要求的 `PRAGMA wal_checkpoint(TRUNCATE)`（DATA-MODEL §4.1、TRUST-BOUNDARIES §11.3）仍是未落地的目标约束。没有强制关闭超时，也没有用 `process.exit()` 绕过资源保护。
 
 ## 4. 崩溃恢复规则

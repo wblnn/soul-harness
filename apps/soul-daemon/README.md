@@ -73,6 +73,7 @@ RUNNING/READY → DRAINING → CLOSING → STOPPED
 
 失败保护：
 
+- `API.beginDrain()` 失败：`#beginApiDrain()` 记录 `http_api` 失败并返回失败结果；`#shutdown()` 立即以 `shutdown_failed` 拒绝关闭。本次关闭流程停在 API Drain 阶段，**不继续执行** `Ingress.close()`、`Scheduler.stop()`、`API.close()`；Store 与 Instance Lock 均不释放。该路径与 `API.close()` 失败后的 sticky failure 保护不同，不能混为一谈。
 - `Scheduler.stop()` reject 或一直 pending：不关 Store、不释放 Lock。
 - `API.close()` 失败：保留 API 对象与 sticky failure；不关 Store、不释放 Lock；后续 `stop()` 不能绕过。
 - `Store.close()` 失败：不调用 `lock.release()`，锁文件留下；`shutdown_failed` / 退出码 6。
