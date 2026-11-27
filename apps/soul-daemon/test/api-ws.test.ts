@@ -244,6 +244,157 @@ function rawUpgrade(
   });
 }
 
+interface RawSocket {
+  readonly socket: Socket;
+  readonly head: Buffer;
+}
+
+function rawWebSocket(path = '/v1/ws', headers: Record<string, string> = {}): Promise<RawSocket> {
+  return new Promise((resolve, reject) => {
+    const req = request({
+      host: '127.0.0.1',
+      port: 18700,
+      method: 'GET',
+      path,
+      headers: {
+        Host: HOST,
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+        'Sec-WebSocket-Protocol': WS_SUBPROTOCOL,
+        ...headers,
+      },
+    });
+    req.once('upgrade', (_response, socket, head) => {
+      socket.on('error', () => undefined);
+      resolve({ socket, head });
+    });
+    req.once('response', (response) => {
+      response.resume();
+      reject(new Error(`unexpected HTTP ${response.statusCode ?? 0}`));
+    });
+    req.once('error', reject);
+    req.end();
+  });
+}
+
+function maskedTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const mask = randomBytes(4);
+  let header: Buffer;
+  if (payload.length < 126) {
+    header = Buffer.from([0x81, 0x80 | payload.length]);
+  } else if (payload.length < 65_536) {
+    header = Buffer.alloc(4);
+    header.writeUInt8(0x81, 0);
+    header.writeUInt8(0x80 | 126, 1);
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header.writeUInt8(0x81, 0);
+    header.writeUInt8(0x80 | 127, 1);
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  }
+  const masked = Buffer.alloc(payload.length);
+  for (let index = 0; index < payload.length; index += 1) {
+    masked.writeUInt8(payload.readUInt8(index) ^ mask.readUInt8(index % 4), index);
+  }
+  return Buffer.concat([header, mask, masked]);
+}
+
+function readServerClose(
+  socket: Socket,
+  initial: Buffer,
+  timeoutMs = 3000,
+): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    let pending = Buffer.from(initial);
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error('close frame timeout')), timeoutMs);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+    };
+    const finish = (error: Error | null, value?: { code: number; reason: string }): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error !== null) {
+        reject(error);
+      } else {
+        resolve(value as { code: number; reason: string });
+      }
+    };
+    const onError = (error: Error): void => finish(error);
+    const onData = (chunk: Buffer): void => {
+      pending = Buffer.concat([pending, chunk]);
+      parse();
+    };
+    const parse = (): void => {
+      while (pending.length >= 2) {
+        const first = pending.readUInt8(0);
+        const second = pending.readUInt8(1);
+        let length = second & 0x7f;
+        let offset = 2;
+        if (length === 126) {
+          if (pending.length < 4) {
+            return;
+          }
+          length = pending.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (pending.length < 10) {
+            return;
+          }
+          const large = pending.readBigUInt64BE(2);
+          if (large > BigInt(Number.MAX_SAFE_INTEGER)) {
+            finish(new Error('close frame is too large'));
+            return;
+          }
+          length = Number(large);
+          offset = 10;
+        }
+        const masked = (second & 0x80) !== 0;
+        if (masked) {
+          offset += 4;
+        }
+        if (pending.length < offset + length) {
+          return;
+        }
+        const opcode = first & 0x0f;
+        const payload = pending.subarray(offset, offset + length);
+        pending = pending.subarray(offset + length);
+        if (opcode === 0x8) {
+          const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+          const reason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
+          finish(null, { code, reason });
+          return;
+        }
+      }
+    };
+    socket.on('data', onData);
+    socket.on('error', onError);
+    parse();
+  });
+}
+
+async function waitForUpgradeAccepted(timeoutMs = 2000): Promise<RawUpgradeResult> {
+  const deadline = Date.now() + timeoutMs;
+  let last: RawUpgradeResult | null = null;
+  while (Date.now() < deadline) {
+    last = await rawUpgrade('/v1/ws', { 'Sec-WebSocket-Protocol': WS_SUBPROTOCOL });
+    if (last.statusCode === 101) {
+      return last;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`upgrade did not become available: ${last?.statusCode ?? 0}`);
+}
+
 afterEach(async () => {
   while (clients.length > 0) {
     clients.pop()?.close();
@@ -607,6 +758,86 @@ describe('WebSocket auth and snapshot edges', () => {
     await closeClient(sockets.pop() as WebSocket);
     const replacement = await openClient();
     await authenticate(replacement);
+  }, 30_000);
+});
+
+describe('WebSocket close-handshake slot ownership', () => {
+  it('keeps an unauthenticated slot until the rejected socket actually closes', async () => {
+    let tick = 0;
+    await makeServer(() => {
+      tick += 1000;
+      return tick;
+    });
+    const held: Socket[] = [];
+    for (let index = 0; index < 15; index += 1) {
+      held.push(
+        await rawUpgradeHold('/v1/ws', {
+          'Sec-WebSocket-Protocol': WS_SUBPROTOCOL,
+        }),
+      );
+    }
+
+    const rejected = await rawWebSocket();
+    const closed = readServerClose(rejected.socket, rejected.head);
+    rejected.socket.write(maskedTextFrame(JSON.stringify({ type: 'auth', token: 'wrong' })));
+    expect(await closed).toStrictEqual({ code: 1008, reason: 'unauthorized' });
+
+    // The client deliberately does not answer the close handshake and keeps
+    // the TCP socket alive. The slot must still belong to this connection.
+    expect(rejected.socket.destroyed).toBe(false);
+    expect(
+      (
+        await rawUpgrade('/v1/ws', {
+          'Sec-WebSocket-Protocol': WS_SUBPROTOCOL,
+        })
+      ).statusCode,
+    ).toBe(503);
+
+    rejected.socket.destroy();
+    expect((await waitForUpgradeAccepted()).statusCode).toBe(101);
+    for (const socket of held) {
+      socket.destroy();
+    }
+  }, 20_000);
+
+  it('keeps the unauth slot when the 33rd authentication is rejected', async () => {
+    let tick = 0;
+    await makeServer(() => {
+      tick += 1000;
+      return tick;
+    });
+    for (let index = 0; index < 32; index += 1) {
+      const socket = await openClient();
+      await authenticate(socket);
+    }
+
+    const rejected = await rawWebSocket();
+    const closed = readServerClose(rejected.socket, rejected.head);
+    rejected.socket.write(maskedTextFrame(AUTH));
+    expect(await closed).toStrictEqual({ code: 1013, reason: 'server_busy' });
+    expect(rejected.socket.destroyed).toBe(false);
+
+    const held: Socket[] = [];
+    for (let index = 0; index < 15; index += 1) {
+      held.push(
+        await rawUpgradeHold('/v1/ws', {
+          'Sec-WebSocket-Protocol': WS_SUBPROTOCOL,
+        }),
+      );
+    }
+    expect(
+      (
+        await rawUpgrade('/v1/ws', {
+          'Sec-WebSocket-Protocol': WS_SUBPROTOCOL,
+        })
+      ).statusCode,
+    ).toBe(503);
+
+    rejected.socket.destroy();
+    expect((await waitForUpgradeAccepted()).statusCode).toBe(101);
+    for (const socket of held) {
+      socket.destroy();
+    }
   }, 30_000);
 });
 

@@ -241,15 +241,13 @@ class ClientConnection {
     }
     this.#closed = true;
     this.#clearLocalState();
-    this.#hub.release(this.#slot);
+    // The slot remains occupied until the peer completes the close handshake
+    // (or the socket errors/terminates). Releasing here would let a new
+    // connection exceed the live-connection cap during the handshake window.
     try {
       this.#socket.close(code, reason);
     } catch {
-      try {
-        this.#socket.terminate();
-      } catch {
-        // Already gone.
-      }
+      this.#terminate();
     }
   }
 
@@ -403,7 +401,8 @@ export class WebSocketHub {
       return false;
     }
     if (this.#authSlots.size >= MAX_AUTHENTICATED) {
-      this.release(slot);
+      // Do not release here: the caller closes this connection and #onClose()
+      // (or the terminate path) owns slot release after the actual socket ends.
       return false;
     }
     this.#unauthSlots.delete(slot);
