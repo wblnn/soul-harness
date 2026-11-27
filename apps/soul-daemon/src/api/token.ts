@@ -45,6 +45,8 @@ export interface TokenLoadOptions {
   /** `null` simulates a POSIX platform without O_NOFOLLOW. */
   readonly noFollow?: number | null;
   readonly getuid?: () => number | undefined;
+  /** Test-only: runs after the first token create path before the final dataDir check. */
+  readonly afterCreate?: () => void;
 }
 
 export interface ApiTokenVerifier {
@@ -56,6 +58,7 @@ interface ResolvedTokenOptions {
   readonly platform: NodeJS.Platform;
   readonly noFollow: number | null;
   readonly getuid: () => number | undefined;
+  readonly afterCreate?: () => void;
 }
 
 export interface TokenDescriptorOptions {
@@ -74,6 +77,7 @@ function resolveOptions(options: TokenLoadOptions | undefined): ResolvedTokenOpt
       options?.getuid ??
       ((): number | undefined =>
         typeof process.getuid === 'function' ? process.getuid() : undefined),
+    ...(options?.afterCreate === undefined ? {} : { afterCreate: options.afterCreate }),
   };
 }
 
@@ -151,7 +155,7 @@ function assertRegularFile(stat: Stats, platform: NodeJS.Platform): void {
   if (!stat.isFile()) {
     invalid('API token path is not a regular file');
   }
-  if (platform !== 'win32' && (stat.mode & 0o777) !== TOKEN_FILE_MODE) {
+  if (platform !== 'win32' && (stat.mode & 0o7777) !== TOKEN_FILE_MODE) {
     invalid('API token file permissions must be 0600');
   }
 }
@@ -385,5 +389,8 @@ function loadOrCreateApiTokenWithOptions(
   if (existing !== null) {
     return makeVerifier(existing);
   }
-  return makeVerifier(createToken(path, opts));
+  const created = createToken(path, opts);
+  opts.afterCreate?.();
+  assertSecureDataDir(dataDir, opts);
+  return makeVerifier(created);
 }

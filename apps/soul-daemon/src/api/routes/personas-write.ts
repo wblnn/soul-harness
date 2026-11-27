@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 
 import { ApiError } from '../errors.js';
 import type { DaemonApi } from '../daemon-api.js';
-import { parseId } from '../http/limits.js';
+import { parsePersonaId } from '../http/limits.js';
 
 const DISPLAY_NAME_MAX_LENGTH = 128;
 
@@ -44,28 +44,28 @@ export function registerPersonaWriteRoutes(app: FastifyInstance, api: DaemonApi)
 
   app.post('/v1/personas/:personaId/start', async (request, reply) => {
     const params = request.params as Record<string, unknown>;
-    const personaId = parseId(params['personaId']);
+    const personaId = parsePersonaId(params['personaId']);
     const persona = await api.startPersona(personaId);
     return reply.code(200).send({ persona });
   });
 
   app.post('/v1/personas/:personaId/suspend', async (request, reply) => {
     const params = request.params as Record<string, unknown>;
-    const personaId = parseId(params['personaId']);
+    const personaId = parsePersonaId(params['personaId']);
     const persona = await api.suspendPersona(personaId);
     return reply.code(200).send({ persona });
   });
 
   app.post('/v1/personas/:personaId/resume', async (request, reply) => {
     const params = request.params as Record<string, unknown>;
-    const personaId = parseId(params['personaId']);
+    const personaId = parsePersonaId(params['personaId']);
     const persona = await api.resumePersona(personaId);
     return reply.code(200).send({ persona });
   });
 
   app.post('/v1/personas/:personaId/stop', async (request, reply) => {
     const params = request.params as Record<string, unknown>;
-    const personaId = parseId(params['personaId']);
+    const personaId = parsePersonaId(params['personaId']);
     const persona = await api.stopPersona(personaId);
     return reply.code(200).send({ persona });
   });

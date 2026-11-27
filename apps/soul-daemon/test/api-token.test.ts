@@ -166,6 +166,43 @@ describe('API token lifecycle', () => {
     expect(codeOf(() => loadOrCreateApiToken(dir))).toBe('api_token_invalid');
   });
 
+  it.skipIf(!isPosix)('rejects setuid, setgid and sticky permission bits', () => {
+    const dir = tempDir();
+    loadOrCreateApiToken(dir);
+    let tested = 0;
+    for (const mode of [0o4600, 0o2600, 0o1600]) {
+      chmodSync(tokenPath(dir), mode);
+      const actual = statSync(tokenPath(dir)).mode & 0o7777;
+      if (actual !== mode) {
+        // The filesystem refused to preserve this special bit; do not claim
+        // coverage that was not actually established.
+        continue;
+      }
+      tested += 1;
+      expect(
+        codeOf(() => loadOrCreateApiToken(dir)),
+        `mode 0${mode.toString(8)}`,
+      ).toBe('api_token_invalid');
+    }
+    expect(tested).toBeGreaterThan(0);
+  });
+
+  it.skipIf(!isPosix)('rechecks the data directory after first creating the token', () => {
+    const dir = tempDir();
+    let hookRan = false;
+    const code = codeOf(() =>
+      loadOrCreateApiTokenForTest(dir, {
+        platform: process.platform,
+        afterCreate: () => {
+          hookRan = true;
+          chmodSync(dir, 0o755);
+        },
+      }),
+    );
+    expect(hookRan).toBe(true);
+    expect(code).toBe('api_token_insecure');
+    expect(existsSync(tokenPath(dir))).toBe(true);
+  });
   it.skipIf(!isPosix)('rejects an existing data directory with group/other permissions', () => {
     const dir = tempDir();
     loadOrCreateApiToken(dir);

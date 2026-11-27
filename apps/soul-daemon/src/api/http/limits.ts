@@ -3,6 +3,8 @@
  * here: these helpers only turn untrusted request text into bounded values.
  */
 
+import { isPersonaId, type PersonaId } from '@soul-harness/contracts';
+
 import { API_DEFAULT_LIST_LIMIT, API_MAX_LIST_LIMIT } from '../wire.js';
 import { ApiError } from '../errors.js';
 
@@ -85,7 +87,15 @@ export function parseEnum<T extends string>(value: unknown, allowed: readonly T[
   return raw as T;
 }
 
-/** Path parameters are opaque strings here; the Runtime validates the branded id. */
+/** Persona path parameters must satisfy the authoritative contracts identity. */
+export function parsePersonaId(value: unknown): PersonaId {
+  if (!isPersonaId(value)) {
+    throw new ApiError('invalid_request');
+  }
+  return value;
+}
+
+/** Other path parameters are opaque here; the Runtime validates their branded id. */
 export function parseId(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > 128) {
     throw new ApiError('invalid_request');

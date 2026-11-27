@@ -352,6 +352,85 @@ describe('HTTP read routes and DTOs', () => {
     expect(eventOne.json()).toStrictEqual({ event });
   });
 
+  it('rejects malformed persona ids before any facade call', async () => {
+    const calls = {
+      getPersona: 0,
+      listEvents: 0,
+      getEvent: 0,
+      listTasks: 0,
+      listSessions: 0,
+      startPersona: 0,
+    };
+    const server = makeServer({
+      api: makeApi({
+        getPersona: () => {
+          calls.getPersona += 1;
+          return null;
+        },
+        listEvents: () => {
+          calls.listEvents += 1;
+          return [];
+        },
+        getEvent: () => {
+          calls.getEvent += 1;
+          return null;
+        },
+        listTasks: () => {
+          calls.listTasks += 1;
+          return [];
+        },
+        listSessions: () => {
+          calls.listSessions += 1;
+          return [];
+        },
+        startPersona: async () => {
+          calls.startPersona += 1;
+          return persona;
+        },
+      }),
+    });
+    const malformed = 'psn_bad';
+    const requests = [
+      { method: 'GET', url: `/v1/personas/${malformed}` },
+      { method: 'GET', url: `/v1/personas/${malformed}/events` },
+      { method: 'GET', url: `/v1/personas/${malformed}/events/${event.id}` },
+      { method: 'GET', url: `/v1/personas/${malformed}/tasks` },
+      { method: 'GET', url: `/v1/personas/${malformed}/sessions` },
+      { method: 'POST', url: `/v1/personas/${malformed}/start` },
+    ];
+    for (const request of requests) {
+      const response = await server.app.inject({
+        ...request,
+        headers: headers(AUTH),
+      });
+      expect(response.statusCode, request.url).toBe(400);
+      expect(response.json()).toStrictEqual({
+        error: { code: 'invalid_request', message: 'invalid request' },
+      });
+    }
+    expect(calls).toStrictEqual({
+      getPersona: 0,
+      listEvents: 0,
+      getEvent: 0,
+      listTasks: 0,
+      listSessions: 0,
+      startPersona: 0,
+    });
+  });
+
+  it('keeps not-found semantics for a well-formed missing persona', async () => {
+    const server = makeServer();
+    const response = await server.app.inject({
+      method: 'GET',
+      url: '/v1/personas/psn_01J00000000000000000000001',
+      headers: headers(AUTH),
+    });
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toStrictEqual({
+      error: { code: 'not_found', message: 'resource not found' },
+    });
+  });
+
   it('uses persona-scoped event lookup', async () => {
     const calls: Array<{ personaId: string; eventId: string }> = [];
     const server = makeServer({

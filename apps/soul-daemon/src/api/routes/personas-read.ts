@@ -6,7 +6,7 @@ import { PERSONA_STATES } from '@soul-harness/persistence';
 
 import { ApiError } from '../errors.js';
 import type { DaemonApi } from '../daemon-api.js';
-import { parseEnum, parseId, parseListLimit } from '../http/limits.js';
+import { parseEnum, parseListLimit, parsePersonaId } from '../http/limits.js';
 
 export function registerPersonaReadRoutes(app: FastifyInstance, api: DaemonApi): void {
   app.get('/v1/personas', async (request, reply) => {
@@ -20,7 +20,7 @@ export function registerPersonaReadRoutes(app: FastifyInstance, api: DaemonApi):
 
   app.get('/v1/personas/:personaId', async (request, reply) => {
     const params = request.params as Record<string, unknown>;
-    const personaId = parseId(params['personaId']);
+    const personaId = parsePersonaId(params['personaId']);
     const persona = api.getPersona(personaId);
     if (persona === null) {
       throw new ApiError('not_found');

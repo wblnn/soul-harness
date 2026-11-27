@@ -47,6 +47,9 @@ importers:
       '@fastify/websocket':
         specifier: 11.3.7
         version: 11.3.7
+      '@soul-harness/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@soul-harness/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
