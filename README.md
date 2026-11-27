@@ -15,14 +15,14 @@ Monorepo 根工程化已完成（SH-005）。
 
 **P1 进行中。** `packages/persistence` 的 SH-006A–D 已完成；其后还有已合并的 SH-008P 分页与条件写原语、SH-008C 所用的会话复用与 P1 信封提交，以及 SH-008D D1 任务状态机。这些不另计为 SH-006 的再次验收。`apps/soul-daemon` 的生命周期与装配层（SH-007A）已完成；`packages/runtime` 已有 ID 分配、Persona 生命周期、P1 Ingress、`recoverRuntime`、Scheduler，以及 SH-008E 的 Daemon 装配代码。**SH-008D 已完成并通过独立复审与整批验收。SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，但 SH-008E 整批仍等待最终独立验收签署。**
 
-**SH-009 本地管理 API 已落地：** E1–E4、E5.P0、E5A 已分别完成并通过独立复审；E5B 文档同步正在进行。**SH-009 整批尚未正式验收。** Daemon 当前在 `RUNNING` 时已装配 Persona Recovery、Runtime Recovery、Ingress、Scheduler、本地 HTTP/WebSocket/Health 与 Token 保护。Scheduler Handler Map 仍为空，`taskDispatch=unavailable_no_handlers`，不会派发真实任务。
+**SH-009 本地管理 API 已落地：** E1–E4、E5.P0、E5A 已分别完成并通过独立复审；E5B 文档同步已提交，等待独立复审。**SH-009 整批尚未正式验收。** Daemon 当前在 `RUNNING` 时已装配 Persona Recovery、Runtime Recovery、Ingress、Scheduler、本地 HTTP/WebSocket/Health 与 Token 保护。Scheduler Handler Map 仍为空，`taskDispatch=unavailable_no_handlers`，不会派发真实任务。
 
 **P1 Runtime 仍不具备认知循环。** 没有主观记忆生成、思维循环、扫描 A/B、检查点装载/写出或真实任务 Handler；本地 API 只是管理与状态查询，不是外部 Stimulus transport。**不得把 SH-008E 的等待最终签署写成“已验收”，也不得把 SH-009 的单批复审写成整批验收。**
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 主计划、ADR、信任边界、数据模型、生命周期、模块边界、身份协议、协作规范 | 文档主体已完成（SH-001 → SH-003.2）；**`packages/contracts` 已实现（SH-004）** |
-| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期（SH-007A）**、**SH-008D 整批验收** 已完成。SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，整批等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已通过独立复审，E5B 文档同步进行中，整批未验收。Daemon 已装配 Persona / Runtime Recovery、Ingress、Scheduler 与本地 HTTP/WS/Health；Scheduler Handler Map 为空，P1 认知循环未运行 |
+| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期（SH-007A）**、**SH-008D 整批验收** 已完成。SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，整批等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已通过独立复审，E5B 文档同步已提交，等待独立复审，整批未验收。Daemon 已装配 Persona / Runtime Recovery、Ingress、Scheduler 与本地 HTTP/WS/Health；Scheduler Handler Map 为空，P1 认知循环未运行 |
 | P2+ | 事件接入、记忆网络、激活、自主认知、遗忘、睡眠梦境、外部适配 | 未开始 |
 
 目录和文档存在**不代表**功能完成。任何"已实现"必须以测试与验收记录为凭。

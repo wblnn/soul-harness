@@ -1,7 +1,7 @@
 # RUNTIME-LIFECYCLE — 运行时生命周期
 
 - **地位**：Daemon、Persona、Thought、Event、Sleep 的状态机与启停顺序权威描述。
-- **状态**：下表是目标顺序，不是完成清单。SH-007A 实现了基础设施半段（配置、日志、数据目录、单实例锁、API Token、打开 SQLite、Migration、Schema 校验、启停状态机）。`packages/runtime` 里已有进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 `createScheduler`（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health，E5B 文档同步进行中，整批尚未验收。Scheduler Handler Map 为空，进入 `RUNNING` 只表示组件已装配；人格认知循环没有运行。
+- **状态**：下表是目标顺序，不是完成清单。SH-007A 实现了基础设施半段（配置、日志、数据目录、单实例锁、API Token、打开 SQLite、Migration、Schema 校验、启停状态机）。`packages/runtime` 里已有进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 `createScheduler`（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health，E5B 文档同步已提交，等待独立复审，整批尚未验收。Scheduler Handler Map 为空，进入 `RUNNING` 只表示组件已装配；人格认知循环没有运行。
 - **实现注记**：状态名在已落地的 Daemon 代码中是集中常量，不得在新代码里散落同义字符串。
 
 ---
@@ -35,7 +35,7 @@
 
 **顺序是硬的。** 特别地：没有单实例锁就不许开库；没跑完 Migration 不许恢复 Persona；API 最后开。
 
-> **当前实现（不修改上表的目标顺序）。** 步骤 1–6 与进入 `RUNNING` 的状态机是 SH-007A；Token 在锁之后、SQLite 之前创建。SH-008E 已把步骤 7–10 接入 Daemon，SH-008E 整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已把步骤 11–12 接入同一 API 服务器；E5B 文档同步进行中，整批尚未验收。
+> **当前实现（不修改上表的目标顺序）。** 步骤 1–6 与进入 `RUNNING` 的状态机是 SH-007A；Token 在锁之后、SQLite 之前创建。SH-008E 已把步骤 7–10 接入 Daemon，SH-008E 整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已把步骤 11–12 接入同一 API 服务器；E5B 文档同步已提交，等待独立复审，整批尚未验收。
 >
 > | 步骤 | 当前实际行为 |
 > |---|---|

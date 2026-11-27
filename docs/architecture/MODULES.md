@@ -1,7 +1,7 @@
 # MODULES — 模块边界与依赖规则
 
 - **地位**：模块职责与依赖方向的唯一权威描述。新增跨模块依赖前必须先改本文件。
-- **状态**：`contracts`（协议层，SH-004）、`persistence` 的 SH-006A–D 与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 包内已有 ID 分配（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 Scheduler（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将四者接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token，E5B 文档同步进行中，整批尚未验收。扫描 A/B、检查点装载/写出、真实任务 Handler 未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
+- **状态**：`contracts`（协议层，SH-004）、`persistence` 的 SH-006A–D 与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 包内已有 ID 分配（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 Scheduler（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将四者接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token，E5B 文档同步已提交，等待独立复审，整批尚未验收。扫描 A/B、检查点装载/写出、真实任务 Handler 未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
 - **原则**：不为目录完整而创建空类。模块目录先有 `README.md` 说明职责与当前状态，代码在对应阶段再写。
 
 ---
@@ -93,7 +93,7 @@
 **当前代码（不改写上表的目标职责）**：
 
 - `apps/soul-daemon`（SH-007A）已实现配置、结构化日志、数据目录探测、单实例锁、API Token、打开 SQLite、Migration、Schema 校验、启停状态机与资源逆序释放。进程可以进入 `RUNNING`；SH-008E 已装配 Persona 恢复、Runtime 恢复、Event Bus、Scheduler，SH-008E 整批等待最终独立验收签署。
-- SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health、Bearer Token 与 Persona 管理接口；E5B 文档同步进行中，整批尚未验收。API 是管理与状态查询接口，不属于 Adapter SDK，也不是外部 Stimulus transport。Scheduler Handler Map 为空，不派发任务；认知循环没有运行。
+- SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health、Bearer Token 与 Persona 管理接口；E5B 文档同步已提交，等待独立复审，整批尚未验收。API 是管理与状态查询接口，不属于 Adapter SDK，也不是外部 Stimulus transport。Scheduler Handler Map 为空，不派发任务；认知循环没有运行。
 - `CHECKPOINTING` 跳过的是 Runtime checkpoint（`runtime_state.checkpoint_json`），不是 SQLite WAL checkpoint。关闭数据库没有显式 `PRAGMA wal_checkpoint`；`DatabaseSync.close()` 可能触发 SQLite 默认自动 checkpoint。
 - SH-007B 不是下一代码批次，也不单独实施代码。它依赖 SH-008 与 SH-009 的批次验收完成之后，再验收 Daemon 的启动、就绪、关闭、资源释放与失败处理。细项通过标准不在此预先规定。
 - `soul-studio`、`soul-cli` 目录不存在。上表对它们的描述仍是目标职责。

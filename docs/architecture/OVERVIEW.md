@@ -1,7 +1,7 @@
 # OVERVIEW — Soul Harness 总体架构
 
 - **地位**：本文件与 `TRUST-BOUNDARIES.md`、`DATA-MODEL.md`、`RUNTIME-LIFECYCLE.md`、`MODULES.md`、`IDENTITY-PROTOCOL.md`、`AI-DEVELOPMENT-RULES.md` 共同构成**唯一架构基线**。
-- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配，以及 `runtime` 包内的 ID 分配器、Persona 生命周期、进程内 Ingress、P1 `recoverRuntime` 和 Scheduler）。SH-008D 已完成并通过独立复审与整批验收（`4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token；E5B 文档同步进行中，整批尚未验收。Scheduler Handler Map 为空，认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
+- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配，以及 `runtime` 包内的 ID 分配器、Persona 生命周期、进程内 Ingress、P1 `recoverRuntime` 和 Scheduler）。SH-008D 已完成并通过独立复审与整批验收（`4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token；E5B 文档同步已提交，等待独立复审，整批尚未验收。Scheduler Handler Map 为空，认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
 - **上位决策**：`docs/adr/ADR-001-independent-runtime.md`
 
 ---
@@ -140,7 +140,7 @@ Soul Harness 是一个**独立常驻的认知运行时**：人格身份、主观
 | `runtime` | **包内部分有代码**：SH-008A ID 分配器；SH-008B 进程内 Persona 生命周期（含 `normalizeCrashedPersonas`）；SH-008C 进程内 P1 Ingress；SH-008D D2 `recoverRuntime`（D2.R1–R4 已通过最终独立代码复审）；SH-008D D3 `createScheduler`（D3.R1 已通过独立复审）。测试见 `packages/runtime/test/`。不装载/写出检查点，不做扫描 A/B。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`） |
 | `soul-daemon` | **已实现生命周期装配（SH-007A）与 Runtime/API 装配**：配置、日志、数据目录、单实例锁、API Token、SQLite/Migration、Schema、Persona Recovery、Runtime Recovery、Ingress、空 Handler Scheduler、本地 HTTP/WebSocket/Health、启停状态机。SH-008E 整批仍等待最终独立验收签署；SH-009 已通过 E1–E4、E5.P0、E5A 的独立复审，整批未验收。进入 `RUNNING` 只表示这些组件已装配；人格认知循环没有运行 |
 | Daemon 上的 Persona Recovery、Runtime Recovery、Event Bus、Scheduler | **已装配。** SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，整批等待最终验收签署。Scheduler Handler Map 为空，不派发任务；Ingress 无 transport，不接受外部 Stimulus |
-| HTTP / WebSocket / 健康检查 | **已实现（SH-009 E1–E4、E5.P0、E5A；E5B 文档同步中）**：本地管理 API、首帧鉴权的 `soul.ws.v1`、最小 live/ready。不是外部 Stimulus transport；无完整健康指标、Supervisor 或 health loop |
+| HTTP / WebSocket / 健康检查 | **已实现（SH-009 E1–E4、E5.P0、E5A；E5B 文档同步已提交，等待独立复审）**：本地管理 API、首帧鉴权的 `soul.ws.v1`、最小 live/ready。不是外部 Stimulus transport；无完整健康指标、Supervisor 或 health loop |
 | 记忆图 / 激活 / 睡眠 / 梦境 / 执行网关 | **未实现** |
 | Studio / CLI | **未实现**（目录不存在） |
 | SH-007B | **未开始**。不是 SH-008 的前置代码阶段，不单独实施代码；依赖 SH-008 与 SH-009 真实组件接入后的 Daemon 集成验收 |
