@@ -1,7 +1,7 @@
 # OVERVIEW — Soul Harness 总体架构
 
 - **地位**：本文件与 `TRUST-BOUNDARIES.md`、`DATA-MODEL.md`、`RUNTIME-LIFECYCLE.md`、`MODULES.md`、`IDENTITY-PROTOCOL.md`、`AI-DEVELOPMENT-RULES.md` 共同构成**唯一架构基线**。
-- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配，以及 `runtime` 包内的 ID 分配器、Persona 生命周期、进程内 Ingress、P1 `recoverRuntime` 和 Scheduler）。SH-008D 已完成并通过独立复审与整批验收（`4f290e8`）。Daemon 没有把这些函数接进启动顺序，认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
+- **状态**：本文描述目标形态。基础设施已部分落地（`contracts`、`persistence`、Daemon 生命周期装配，以及 `runtime` 包内的 ID 分配器、Persona 生命周期、进程内 Ingress、P1 `recoverRuntime` 和 Scheduler）。SH-008D 已完成并通过独立复审与整批验收（`4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token；E5B 文档同步进行中，整批尚未验收。Scheduler Handler Map 为空，认知循环尚未运行。已实现范围以 §9 为准，不得把目标架构读成现行能力。
 - **上位决策**：`docs/adr/ADR-001-independent-runtime.md`
 
 ---
@@ -121,11 +121,13 @@ Soul Harness 是一个**独立常驻的认知运行时**：人格身份、主观
 | 服务 | 默认地址 | 说明 |
 |---|---|---|
 | Daemon HTTP API | `127.0.0.1:18700` | 仅 loopback，本地令牌鉴权，协议版本协商 |
-| Daemon WebSocket | 同端口 | 实时状态推送，连接时鉴权 |
+| Daemon WebSocket | 同端口 | 首帧鉴权的状态快照通道（pull），不是事件推送 |
 | Studio 开发服务器 | `127.0.0.1:18701` | 仅开发期；生产由 Daemon 托管静态资源 |
 
 必须：只监听 loopback、校验令牌与来源、严格 CORS、限制请求体大小、管理操作单独鉴权。
 **不得**把 Host/Origin 简单校验当成认证。
+
+**当前实现（SH-009 E1–E4、E5.P0、E5A）**：Daemon 在 `127.0.0.1:18700` 同时提供 HTTP 与 WebSocket。管理路由要求 Bearer Token，Health `live` / `ready` 为匿名最小端点；Host 精确匹配 `127.0.0.1:18700`，Origin 精确允许 Studio 开发源 `http://127.0.0.1:18701` 与同源 `http://127.0.0.1:18700`；无 Cookie Token、URL query Token 或 Token bootstrap。API 是管理与状态查询接口，不是外部 Stimulus transport；不存在 `POST /v1/stimuli`。Scheduler Handler Map 为空，不派发任务。
 
 ## 9. 当前实现状态
 
@@ -135,10 +137,10 @@ Soul Harness 是一个**独立常驻的认知运行时**：人格身份、主观
 | Monorepo 骨架 | **已实现**（SH-005） |
 | `contracts` | **已实现（协议层，SH-004）**：类型与 10 份已注册 Schema。不生成 ID，无 IO |
 | `persistence` | **SH-006A–D 已完成**：连接、WAL 模式、单写入事务、Migration、字段映射、Runtime checkpoint envelope 存取。其后 main 上还有 SH-008P 的键集分页与条件写、SH-008C 的会话复用与 P1 信封提交、SH-008D D1 的任务条件状态机。这些是后续提交，不另计为 SH-006 的再次验收。不执行显式 `PRAGMA wal_checkpoint`，不重建 Runtime，不在本包装配 Daemon |
-| `runtime` | **包内部分有代码**：SH-008A ID 分配器；SH-008B 进程内 Persona 生命周期（含 `normalizeCrashedPersonas`）；SH-008C 进程内 P1 Ingress；SH-008D D2 `recoverRuntime`（D2.R1–R4 已通过最终独立代码复审）；SH-008D D3 `createScheduler`（D3.R1 已通过独立复审）。测试见 `packages/runtime/test/`。不装载/写出检查点，不做扫描 A/B。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。Daemon 未调用本包 |
-| `soul-daemon` | **已实现生命周期装配（SH-007A）**：配置、日志、数据目录、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机。进入 `RUNNING` 只表示进程持有数据库与锁，人格认知循环没有运行 |
-| Daemon 上的 Persona Recovery、Runtime Recovery、Event Bus、Scheduler | **装配未实现。** `phases.ts` 把这四步标为 `not_implemented`（owner 字符串仍是 `SH-008`）。接线批次是 SH-008E，未开始。包内已有人格归一、进程内 Ingress、`recoverRuntime` 和 Scheduler；Daemon 不创建 Scheduler |
-| HTTP / WebSocket / 健康检查 | **未实现**（源码 owner 记为 SH-009；该任务未开始） |
+| `runtime` | **包内部分有代码**：SH-008A ID 分配器；SH-008B 进程内 Persona 生命周期（含 `normalizeCrashedPersonas`）；SH-008C 进程内 P1 Ingress；SH-008D D2 `recoverRuntime`（D2.R1–R4 已通过最终独立代码复审）；SH-008D D3 `createScheduler`（D3.R1 已通过独立复审）。测试见 `packages/runtime/test/`。不装载/写出检查点，不做扫描 A/B。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`） |
+| `soul-daemon` | **已实现生命周期装配（SH-007A）与 Runtime/API 装配**：配置、日志、数据目录、单实例锁、API Token、SQLite/Migration、Schema、Persona Recovery、Runtime Recovery、Ingress、空 Handler Scheduler、本地 HTTP/WebSocket/Health、启停状态机。SH-008E 整批仍等待最终独立验收签署；SH-009 已通过 E1–E4、E5.P0、E5A 的独立复审，整批未验收。进入 `RUNNING` 只表示这些组件已装配；人格认知循环没有运行 |
+| Daemon 上的 Persona Recovery、Runtime Recovery、Event Bus、Scheduler | **已装配。** SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，整批等待最终验收签署。Scheduler Handler Map 为空，不派发任务；Ingress 无 transport，不接受外部 Stimulus |
+| HTTP / WebSocket / 健康检查 | **已实现（SH-009 E1–E4、E5.P0、E5A；E5B 文档同步中）**：本地管理 API、首帧鉴权的 `soul.ws.v1`、最小 live/ready。不是外部 Stimulus transport；无完整健康指标、Supervisor 或 health loop |
 | 记忆图 / 激活 / 睡眠 / 梦境 / 执行网关 | **未实现** |
 | Studio / CLI | **未实现**（目录不存在） |
 | SH-007B | **未开始**。不是 SH-008 的前置代码阶段，不单独实施代码；依赖 SH-008 与 SH-009 真实组件接入后的 Daemon 集成验收 |

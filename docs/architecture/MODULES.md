@@ -1,7 +1,7 @@
 # MODULES — 模块边界与依赖规则
 
 - **地位**：模块职责与依赖方向的唯一权威描述。新增跨模块依赖前必须先改本文件。
-- **状态**：`contracts`（协议层，SH-004）、`persistence` 的 SH-006A–D 与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 包内已有 ID 分配（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2，D2.R1–R4 已通过最终独立代码复审）和 Scheduler（SH-008D D3，D3.R1 已通过独立复审）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。扫描 A/B、检查点装载/写出与 Daemon 装配（SH-008E）未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
+- **状态**：`contracts`（协议层，SH-004）、`persistence` 的 SH-006A–D 与 `apps/soul-daemon` 的生命周期装配（SH-007A）已实现。`runtime` 包内已有 ID 分配（SH-008A）、进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 Scheduler（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将四者接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health 与 Token，E5B 文档同步进行中，整批尚未验收。扫描 A/B、检查点装载/写出、真实任务 Handler 未实现。全部 L2 认知包、Studio、CLI **未实现**。本文件仍是施工图：某一行标为已实现，只表示该批已交付的基础设施，不表示本行目标职责已经全部完成。
 - **原则**：不为目录完整而创建空类。模块目录先有 `README.md` 说明职责与当前状态，代码在对应阶段再写。
 
 ---
@@ -46,7 +46,7 @@
 |---|---|---|---|
 | `contracts` | 协议类型、JSON Schema（**含 Stimulus 信封与 `requestNonce` 校验规则**）、**身份 ID 格式与生成契约**（`IDENTITY-PROTOCOL.md`）、版本与能力常量 | 运行时逻辑、IO、状态、**数据库列映射**、注册表查询、**不实际分配 ID** | **已实现（协议层）**，测试见 `packages/contracts/test/` |
 | `persistence` | SQLite 连接、单写入协调器、事务、migration、检查点、密钥指针、**camelCase↔snake_case 映射** | 业务语义；不判断"该不该记" | **SH-006A–D 已完成**：连接、WAL 打开、单写入事务、migration、六表 Repository、字段映射、Runtime checkpoint envelope 存取。密钥指针未交付。无显式 `PRAGMA wal_checkpoint`，不重建 Runtime。其后已合并的代码：SH-008P 键集分页与条件写、SH-008C 会话复用与 P1 信封提交、SH-008D D1 任务条件状态机（D1.R1 已通过独立复审；SH-008D 整批已验收，`4f290e8`） |
-| `runtime` | Persona 生命周期、事件总线、任务队列、状态恢复（**pending 归档恢复 + failed 缓冲清理两类扫描**）、提案验证与提交、版本/epoch 控制、**归档决策与冲突审计记录写入**、**六类身份 ID 的分配**（见 `IDENTITY-PROTOCOL.md`）、**入站去重与去重命中后的正文核对**（`compare` 的**唯一**调用方） | 语义解释；不生成回答；**不读 Archive**、不持有 Archive 密钥；不接受外部指定的内部 ID；不负责 Daemon 生命周期装配 | **包内部分有代码**：SH-008A ID 分配；SH-008B 进程内 Persona 生命周期（含崩溃归一函数）；SH-008C 进程内去重（不调用 `compare`，`bodyVerified` 恒为 false）；SH-008D D2 `recoverRuntime`（P1 任务与活跃事件收敛，不是扫描 A/B，不是检查点；D2.R1–R4 已通过最终独立代码复审）；SH-008D D3 Scheduler（`createScheduler`：领取、派发、并发、轮转、失败重试、定时唤醒、`stop` 收口；D3.R1 已通过独立复审）。SH-008D 的 D4 集成验证已进入 consumer-check，整批已验收（`4f290e8`）。经 persistence 仓储，无裸 SQL。测试见 `packages/runtime/test/`。扫描 A/B、检查点编排、Daemon 装配、`compare` 调用仍未实现。SH-008E 才把 Persona Recovery、Runtime Recovery、Ingress 和 Scheduler 接入 Daemon |
+| `runtime` | Persona 生命周期、事件总线、任务队列、状态恢复（**pending 归档恢复 + failed 缓冲清理两类扫描**）、提案验证与提交、版本/epoch 控制、**归档决策与冲突审计记录写入**、**六类身份 ID 的分配**（见 `IDENTITY-PROTOCOL.md`）、**入站去重与去重命中后的正文核对**（`compare` 的**唯一**调用方） | 语义解释；不生成回答；**不读 Archive**、不持有 Archive 密钥；不接受外部指定的内部 ID；不负责 Daemon 生命周期装配 | **包内部分有代码**：SH-008A ID 分配；SH-008B 进程内 Persona 生命周期（含崩溃归一函数）；SH-008C 进程内去重（不调用 `compare`，`bodyVerified` 恒为 false）；SH-008D D2 `recoverRuntime`（P1 任务与活跃事件收敛，不是扫描 A/B，不是检查点）；SH-008D D3 Scheduler（`createScheduler`：领取、派发、并发、轮转、失败重试、定时唤醒、`stop` 收口）。SH-008D 整批已验收（`4f290e8`）。SH-008E E1–E5、AUDIT-001、E6 已把 Persona Recovery、Runtime Recovery、Ingress 和 Scheduler 接入 Daemon，整批等待最终独立验收签署。经 persistence 仓储，无裸 SQL。测试见 `packages/runtime/test/`。扫描 A/B、检查点编排、`compare` 调用仍未实现 |
 | `personality` | 自我叙事、情绪、关系多维表征、特质缓变 | 不写记忆正文；不授权现实动作 | 未实现 |
 | `attention` | 前注意过滤、优先级、唤醒分级、注意结果（ignored/queued/aware） | 不理解内容；不生成回应 | 未实现 |
 | `perception` | 感知规范化、选择性编码判定、短暂缓冲（TTL） | 不长期保存原文；不建立关联 | 未实现 |
@@ -92,10 +92,10 @@
 
 **当前代码（不改写上表的目标职责）**：
 
-- `apps/soul-daemon`（SH-007A）已实现配置、结构化日志、数据目录探测、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机与资源逆序释放。进程可以进入 `RUNNING`，但这只表示它持有数据库与锁，**人格认知循环没有运行**。
-- 同一应用**未装配**：Persona 恢复、Runtime 恢复、Event Bus、Scheduler。源码把这四步标为 `not_implemented`，owner 字符串仍是 `SH-008`。装配批次是 SH-008E，未开始。包内已有 `normalizeCrashedPersonas`、进程内 Ingress、`recoverRuntime` 和 `createScheduler`（D3，SH-008D 已验收）；Daemon 仍不创建 Scheduler。HTTP / WebSocket、健康检查的 owner 是 SH-009，未开始。
+- `apps/soul-daemon`（SH-007A）已实现配置、结构化日志、数据目录探测、单实例锁、API Token、打开 SQLite、Migration、Schema 校验、启停状态机与资源逆序释放。进程可以进入 `RUNNING`；SH-008E 已装配 Persona 恢复、Runtime 恢复、Event Bus、Scheduler，SH-008E 整批等待最终独立验收签署。
+- SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health、Bearer Token 与 Persona 管理接口；E5B 文档同步进行中，整批尚未验收。API 是管理与状态查询接口，不属于 Adapter SDK，也不是外部 Stimulus transport。Scheduler Handler Map 为空，不派发任务；认知循环没有运行。
 - `CHECKPOINTING` 跳过的是 Runtime checkpoint（`runtime_state.checkpoint_json`），不是 SQLite WAL checkpoint。关闭数据库没有显式 `PRAGMA wal_checkpoint`；`DatabaseSync.close()` 可能触发 SQLite 默认自动 checkpoint。
-- SH-007B 不是下一代码批次，也不单独实施代码。它依赖 SH-008（Persona / Runtime 恢复、Event Bus、Scheduler）与 SH-009（HTTP / WebSocket、健康检查）接入真实组件之后，再验收 Daemon 的启动、就绪、关闭、资源释放与失败处理。细项通过标准不在此预先规定。
+- SH-007B 不是下一代码批次，也不单独实施代码。它依赖 SH-008 与 SH-009 的批次验收完成之后，再验收 Daemon 的启动、就绪、关闭、资源释放与失败处理。细项通过标准不在此预先规定。
 - `soul-studio`、`soul-cli` 目录不存在。上表对它们的描述仍是目标职责。
 
 ## 5. 端口与传输
@@ -103,10 +103,10 @@
 | 通道 | 地址 | 用途 |
 |---|---|---|
 | Daemon HTTP | `127.0.0.1:18700` | 命令与查询 |
-| Daemon WS | `127.0.0.1:18700` | 状态推送 |
+| Daemon WS | `127.0.0.1:18700` | 首帧鉴权的状态快照通道（pull），不是事件推送 |
 | Studio dev | `127.0.0.1:18701` | 仅开发期 |
 
-全部只监听 loopback，带本地令牌与协议版本协商。未来可换 Windows 命名管道 / Unix socket，但**语义不变**。
+全部只监听 loopback。当前 Daemon HTTP/WS 固定在 `127.0.0.1:18700`，管理路由使用 Bearer Token，Health live/ready 匿名，Host/Origin 精确 allowlist；WS 使用 `soul.ws.v1` 和首帧认证。这里没有外部 Stimulus transport，也没有 Token bootstrap、URL query Token 或 Cookie Token。未来可换 Windows 命名管道 / Unix socket，但**语义不变**。
 
 ## 6. 模块 README 要求
 

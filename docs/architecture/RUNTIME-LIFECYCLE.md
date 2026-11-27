@@ -1,7 +1,7 @@
 # RUNTIME-LIFECYCLE — 运行时生命周期
 
 - **地位**：Daemon、Persona、Thought、Event、Sleep 的状态机与启停顺序权威描述。
-- **状态**：下表是目标顺序，不是完成清单。SH-007A 只实现了基础设施半段（配置、日志、数据目录、单实例锁、打开 SQLite、Migration、Schema 校验、启停状态机）。`packages/runtime` 里已经有进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2：D2.R1–R4 已通过最终独立代码复审）和 `createScheduler`（SH-008D D3，D3.R1 已通过独立复审）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。Daemon 不调用它们：Persona Recovery、Runtime Recovery、Event Bus、Scheduler 的装配属于尚未开始的 SH-008E。API（SH-009）没有开始。进入 `RUNNING` 只表示进程持有数据库与锁，人格认知循环没有运行。
+- **状态**：下表是目标顺序，不是完成清单。SH-007A 实现了基础设施半段（配置、日志、数据目录、单实例锁、API Token、打开 SQLite、Migration、Schema 校验、启停状态机）。`packages/runtime` 里已有进程内 Persona 生命周期（SH-008B）、进程内 P1 Ingress（SH-008C）、P1 `recoverRuntime`（SH-008D D2）和 `createScheduler`（SH-008D D3）。SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 Persona Recovery、Runtime Recovery、Ingress、Scheduler 接入 Daemon，整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已实现本地 HTTP/WebSocket/Health，E5B 文档同步进行中，整批尚未验收。Scheduler Handler Map 为空，进入 `RUNNING` 只表示组件已装配；人格认知循环没有运行。
 - **实现注记**：状态名在已落地的 Daemon 代码中是集中常量，不得在新代码里散落同义字符串。
 
 ---
@@ -31,19 +31,20 @@
 | 10 | 初始化 Scheduler（按自适应 Tick） | — |
 | 11 | 启动本地 API + WebSocket（loopback + 令牌） | 端口占用 → `FAILED`，不自动换端口 |
 | 12 | 启动健康检查 | — |
-| 13 | 进入 `RUNNING`，可接收事件 | — |
+| 13 | 进入 `RUNNING`（组件装配完成；外部事件接入仍未实现） | — |
 
 **顺序是硬的。** 特别地：没有单实例锁就不许开库；没跑完 Migration 不许恢复 Persona；API 最后开。
 
-> **当前实现（不修改上表的目标顺序）。** 步骤 1–6 与进入 `RUNNING` 的状态机是 SH-007A。
+> **当前实现（不修改上表的目标顺序）。** 步骤 1–6 与进入 `RUNNING` 的状态机是 SH-007A；Token 在锁之后、SQLite 之前创建。SH-008E 已把步骤 7–10 接入 Daemon，SH-008E 整批仍等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已把步骤 11–12 接入同一 API 服务器；E5B 文档同步进行中，整批尚未验收。
 >
-> | 步骤 | 包内已有的代码 | Daemon 今天实际做的事 |
-> |---|---|---|
-> | 7 恢复 Persona | `normalizeCrashedPersonas`（SH-008B）：只把其它 boot 留下的 `STARTING` / `STOPPING` 收成 `STOPPED`，不自动 start | `persona_recovery` 仍是 `not_implemented`。独占 `RECOVERING`、且先于本 boot 的启停，属于未开始的 SH-008E |
-> | 8 恢复 Runtime | `recoverRuntime`（SH-008D D2，D2.R1–R4 已通过最终独立代码复审）：P1 崩溃收敛。合法 `running` 任务按 §4 的 D-RT1 退回 `queued` 或转 `failed`；`received` / `accepted` 且 `archive_state='none'` 收成 `expired` + `buffer_lost`。不读检查点，不恢复队列或活跃思维，不领取任务 | `runtime_recovery` 仍是 `not_implemented`，注释仍写检查点 / 队列 / 思维。装配属于 SH-008E，未开始 |
-> | 9 Event Bus | 进程内 P1 Ingress（SH-008C）：`createStimulusIngress` / `acceptStimulus`。无 HTTP | `event_bus` 仍是 `not_implemented`。装配属于 SH-008E，未开始 |
-> | 10 Scheduler | `createScheduler`（SH-008D D3，`52549e9`，D3.R1 `86eab59` 已通过独立复审）。进程内领取、派发、Persona×channel 与全局并发限制、轮转、失败后退避并在下次领取时重试、最早到期一次性定时唤醒、`stop()` 等待在途 Handler 后收口。running 任务不能取消，没有 Handler 硬超时；Handler 永不 settle 时 `stop()` 可能无限等待；同步 CPU 密集型 Handler 会阻塞事件循环；Scheduler/Recovery lease 只覆盖同一进程内的同一 `Store` 对象 | `scheduler` 仍是 `not_implemented`。Daemon 不创建 Scheduler。装配属于 SH-008E，未开始 |
-> | 11–12 API / 健康检查 | 无 | 属未开始的 SH-009 |
+> | 步骤 | 当前实际行为 |
+> |---|---|
+> | 7 恢复 Persona | `runPersonaRecovery`：把其它 boot 留下的 `STARTING` / `STOPPING` 收成 `STOPPED`，不自动 start |
+> | 8 恢复 Runtime | `recoverRuntime`：P1 崩溃收敛。合法 `running` 任务按 §4 的 D-RT1 退回 `queued` 或转 `failed`；`received` / `accepted` 且 `archive_state='none'` 收成 `expired` + `buffer_lost`。不读检查点，不恢复队列或活跃思维，不领取任务 |
+> | 9 Event Bus | 创建进程内 P1 Ingress（`transport: none`，`acceptsInput=false`）；没有 HTTP/WS 刺激入口 |
+> | 10 Scheduler | 创建并启动空 Handler Map Scheduler；`handlerKinds=0`、`taskDispatch=unavailable_no_handlers`，不派发任务。没有 Handler 硬超时；Handler 永不 settle 时 `stop()` 可能无限等待 |
+> | 11–12 API / Health | 组装 `DaemonApi` facade，监听 `127.0.0.1:18700`；Health live/ready 随同一服务器可用。只提供管理/状态查询，不是外部 Stimulus transport |
+> | 13 | 进入 `RUNNING`。这表示组件已装配，不表示认知循环运行或可接收外部事件 |
 
 ## 3. Daemon 关闭顺序
 
@@ -62,7 +63,18 @@
 
 强制终止（进程被杀）下，靠 §4 的恢复规则保证一致性；**不保证**梦境或睡眠任务状态。
 
-> **当前实现（SH-007A，不修改上表）**。Daemon 会进入 `CHECKPOINTING` 与 `CLOSING`，但步骤 1–6 里依赖 Runtime 或 API 的动作没有执行。`checkpoint_skipped` 跳过的是 **Runtime checkpoint**（写入 `runtime_state.checkpoint_json` 的队列游标、活跃线程与 epoch），不是 SQLite WAL checkpoint。步骤 7 目前只是 `Store.close()` → `DatabaseSync.close()`：应用层**没有**显式 `PRAGMA wal_checkpoint`。SQLite 在关闭连接时**可能**按默认策略做自动 checkpoint。这既不是“显式 WAL checkpoint 已实现”，也不是“关闭时绝对不会 checkpoint”。遗忘事务要求的 `PRAGMA wal_checkpoint(TRUNCATE)`（DATA-MODEL §4.1、TRUST-BOUNDARIES §11.3）仍是未落地的目标约束。单实例锁的获取与释放已在 SH-007A 实现。
+> **当前实现（不修改上表的目标语义）**。实际阶段是 `DRAINING → CLOSING → STOPPED`，不进入 `CHECKPOINTING`；只记录 `checkpoint_skipped`（Runtime checkpoint 未实现）。
+>
+> | 顺序 | 当前实际行为 |
+> |---|---|
+> | 1 | `API.beginDrain()`：拒绝新管理请求与 WS Upgrade；已鉴权 WS 尽力发送 `shutting_down`，随后关闭 |
+> | 2 | `Ingress.close()` |
+> | 3 | `await Scheduler.stop()`；空 Handler 时结束；reject 或 pending 则不关 Store、不放 Lock |
+> | 4 | `API.close()`；失败时保持 sticky failure，不关 Store、不放 Lock |
+> | 5 | `Store.close()`；失败时不释放 Lock |
+> | 6 | `Lock.release()` |
+>
+> `checkpoint_skipped` 跳过的是 Runtime checkpoint（`runtime_state.checkpoint_json` 的队列游标、活跃线程与 epoch），不是 SQLite WAL checkpoint。应用层没有显式 `PRAGMA wal_checkpoint`；`DatabaseSync.close()` 可能触发默认自动 checkpoint。遗忘事务要求的 `PRAGMA wal_checkpoint(TRUNCATE)`（DATA-MODEL §4.1、TRUST-BOUNDARIES §11.3）仍是未落地的目标约束。没有强制关闭超时，也没有用 `process.exit()` 绕过资源保护。
 
 ## 4. 崩溃恢复规则
 
@@ -86,7 +98,7 @@
 
 > **D-RT1 与当前代码的对应（不另加规则）。** 领取是 persistence 的 `claimNext`：同一条 `UPDATE` 里 `attempt + 1`，写入调用方给出的新 `runId`，`started_at` 写成领取时刻。运行期间 `completeTask` / `failTask` 用当前 `run_id` 与 `attempt` 做条件写，不改 `attempt`。失败且未达上限时，`failTask` 把行退回 `queued`，`attempt` 仍是这一次领取写下的值；下一次重新领取才再加 1 并写入另一个 `runId`。崩溃恢复是 `recoverRunningTask`：未达上限则退回 `queued`，语句不改 `attempt`、不改 `run_id`；达到或超过上限则 `failed`。`recoverRuntime` 对合法的 `running` 行调用它。
 >
-> Scheduler 在包内通过 `claimNext` 领取，批次是已通过独立复审的 SH-008D D3；Recovery 的 D2.R1–R4 已通过最终独立代码复审；SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。Daemon 不调用 `createScheduler`，也不调用 `recoverRuntime` 或 `normalizeCrashedPersonas`。因此上表是恢复规则，进程重启今天不会自动执行它；Daemon 装配仍属于未开始的 SH-008E。
+> Scheduler 在包内通过 `claimNext` 领取，批次是已通过独立复审的 SH-008D D3；Recovery 的 D2.R1–R4 已通过最终独立代码复审；SH-008D 已完成并通过独立复审与整批验收（D4 `8c10f39`，D4.R1 `4f290e8`）。SH-008E 的 E1–E5、AUDIT-001、E6 已将 `createScheduler`、`recoverRuntime` 和 `normalizeCrashedPersonas` 接入 Daemon，整批仍等待最终独立验收签署。Scheduler 仍使用空 Handler Map，不派发任务；进程重启会执行恢复规则，但不会生成认知循环。
 
 ## 5. Persona 状态机
 
@@ -653,6 +665,13 @@ AWAKE ──enter──► SLEEPING
 
 ## 10. 健康检查
 
-必须暴露至少：进程状态、当前 Persona 状态、单实例锁归属、DB 可读写、
+**目标要求（未全部实现）**：必须暴露至少：进程状态、当前 Persona 状态、单实例锁归属、DB 可读写、
 队列深度（按通道）、最近一次成功提交时间、最近一次错误。
 **不得**在健康检查里泄露主观记忆内容或 Archive 审计数据。
+
+**当前实现（SH-009 E1–E4、E5.P0、E5A）**：只有匿名最小端点：
+
+- `GET /v1/health/live` → `{"status":"ok"}`；
+- `GET /v1/health/ready` → `{"status":"ready"}`，或 503 `{"status":"not_ready","reason":...}`。
+
+没有完整健康指标、队列深度、最近成功提交时间或最近错误字段；没有 health loop、Supervisor 或自动重启。管理面的 `/v1/status` 是受 Bearer Token 保护的 StatusView 查询，不是完整健康检查。不要把这些目标指标写成现有 API 已提供。

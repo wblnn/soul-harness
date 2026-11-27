@@ -1,7 +1,7 @@
 # TRUST-BOUNDARIES — 信任边界与权限域
 
 - **地位**：P0 安全约束。任何实现与本文件冲突时，**本文件优先**，实现必须改。
-- **状态**：设计中。所列约束全部为**待实现并待测试**的硬要求。
+- **状态**：P0 约束持续有效；基础设施已部分实现，未实现能力仍按本文件约束。不得把目标隔离写成现行能力。
 
 ---
 
@@ -112,6 +112,8 @@ Soul Harness 要求"记忆可以被真实遗忘，也能形成虚假自传"，�
 
 因此 P1 **只允许**运行不产生跨域安全承诺的功能：人格注册、事件接入、状态恢复、最小 API。
 **不得**向用户或文档宣称"已隔离"。
+
+**当前本地 API 边界（SH-009 E1–E4、E5.P0、E5A）**：Daemon HTTP/WebSocket 只监听 IPv4 loopback `127.0.0.1:18700`；管理路由使用 `<SOUL_DATA_DIR>/api.token` 的 Bearer Token，Health `live` / `ready` 是匿名最小端点；Host 与 Origin 使用精确 allowlist，无通配 CORS、Cookie Token 或 URL query Token。POSIX 上 Token 文件要求当前用户所有、完整 mode 精确 `0600`，首次创建后复查 dataDir；Windows 上 Node 的 mode 不等同于 ACL，边界依赖 dataDir ACL 与同用户信任。该 API 只是本地管理与状态查询，不是外部 Stimulus transport，也不提供 Token bootstrap 或热轮换。本地 loopback、令牌与来源校验不等于物理隔离；P1 仍是单 SQLite、同进程。
 
 ### 5.2 需要物理隔离的能力及其启用门槛
 

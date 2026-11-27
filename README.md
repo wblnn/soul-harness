@@ -13,20 +13,23 @@ DSH / Minecraft / QQ / CLI 都是**可选适配器**；不安装它们，Daemon 
 **P0：架构冻结与工程规范。** 文档主体已完成；`packages/contracts` 已落地（SH-004）；
 Monorepo 根工程化已完成（SH-005）。
 
-**P1 进行中。** `packages/persistence` 的 SH-006A–D 已完成；其后还有已合并的 SH-008P 的分页与条件写原语、SH-008C 所用的会话复用与 P1 信封提交，以及 SH-008D D1 任务状态机（D1.R1 已通过独立复审），这些不另计为 SH-006 的再次验收，也不等于 SH-008D 整批验收。`apps/soul-daemon` 的生命周期与装配层已完成（SH-007A）。`packages/runtime` 已有 ID 分配、进程内 Persona 生命周期、进程内 P1 Ingress、P1 `recoverRuntime` 和 Scheduler。D2.R1–R4 已实施，整体尚未正式关闭。D3 Scheduler 的代码已提交，D3.R1 已通过独立复审。
-**D4 与 SH-008E 尚未开始。扫描 A/B、检查点编排、API/WebSocket 仍未实现。Daemon 尚未装配 Runtime：启动不会创建 Scheduler，也不会调用人格归一、`recoverRuntime` 或 Ingress。**
+**P1 进行中。** `packages/persistence` 的 SH-006A–D 已完成；其后还有已合并的 SH-008P 分页与条件写原语、SH-008C 所用的会话复用与 P1 信封提交，以及 SH-008D D1 任务状态机。这些不另计为 SH-006 的再次验收。`apps/soul-daemon` 的生命周期与装配层（SH-007A）已完成；`packages/runtime` 已有 ID 分配、Persona 生命周期、P1 Ingress、`recoverRuntime`、Scheduler，以及 SH-008E 的 Daemon 装配代码。**SH-008D 已完成并通过独立复审与整批验收。SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，但 SH-008E 整批仍等待最终独立验收签署。**
+
+**SH-009 本地管理 API 已落地：** E1–E4、E5.P0、E5A 已分别完成并通过独立复审；E5B 文档同步正在进行。**SH-009 整批尚未正式验收。** Daemon 当前在 `RUNNING` 时已装配 Persona Recovery、Runtime Recovery、Ingress、Scheduler、本地 HTTP/WebSocket/Health 与 Token 保护。Scheduler Handler Map 仍为空，`taskDispatch=unavailable_no_handlers`，不会派发真实任务。
+
+**P1 Runtime 仍不具备认知循环。** 没有主观记忆生成、思维循环、扫描 A/B、检查点装载/写出或真实任务 Handler；本地 API 只是管理与状态查询，不是外部 Stimulus transport。**不得把 SH-008E 的等待最终签署写成“已验收”，也不得把 SH-009 的单批复审写成整批验收。**
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | 主计划、ADR、信任边界、数据模型、生命周期、模块边界、身份协议、协作规范 | 文档主体已完成（SH-001 → SH-003.2）；**`packages/contracts` 已实现（SH-004）** |
-| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo 骨架（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期与装配（SH-007A）** 已完成。Runtime 包内：SH-008A / SH-008B 维持「代码层面已交付」；SH-008C 代码已合并；SH-008D 的 D1.R1 与 D3.R1 已通过独立复审，D2 有代码但整体未正式关闭，D4 未开始，整批未验收。SH-008E 与 API / WebSocket 未开始 |
+| P1 | Monorepo 骨架、Daemon 生命周期、Persistence、最小 API | **Monorepo（SH-005）**、**Persistence（SH-006A–D）**、**Daemon 生命周期（SH-007A）**、**SH-008D 整批验收** 已完成。SH-008E 的 E1–E5、AUDIT-001、E6 已实施/合并，整批等待最终独立验收签署。SH-009 E1–E4、E5.P0、E5A 已通过独立复审，E5B 文档同步进行中，整批未验收。Daemon 已装配 Persona / Runtime Recovery、Ingress、Scheduler 与本地 HTTP/WS/Health；Scheduler Handler Map 为空，P1 认知循环未运行 |
 | P2+ | 事件接入、记忆网络、激活、自主认知、遗忘、睡眠梦境、外部适配 | 未开始 |
 
 目录和文档存在**不代表**功能完成。任何"已实现"必须以测试与验收记录为凭。
 目前按当时记录交付的是 `packages/contracts`（SH-004）、`packages/persistence` 的 SH-006A–D、
 `apps/soul-daemon` 的生命周期装配（SH-007A），以及 `packages/runtime` 的 ID 分配器（SH-008A）
-与进程内 Persona 生命周期（SH-008B）。SH-008C 的代码已合并。SH-008D 的 D1.R1 与 D3 Scheduler（D3.R1）已通过独立复审；D2.R1–R4 已实施，整体尚未正式关闭；D4 未开始，整批未验收。
-这些都不是已经在 Daemon 里运行的认知循环。Daemon 不创建 Scheduler。
+与进程内 Persona 生命周期（SH-008B）。SH-008C 的代码已合并；SH-008D 已完成并通过独立复审与整批验收。SH-008E 的装配代码已实施/合并，整批等待最终独立验收签署。
+这些都不等于 P1 认知循环已经在 Daemon 里运行。Daemon 会创建空的 Handler Map Scheduler；没有真实任务 Handler、主观记忆、思维循环、扫描 A/B 或检查点编排。SH-008E 整批仍等待最终独立验收签署；SH-009 整批仍等待最终验收。
 
 ## 文档入口
 
@@ -49,11 +52,11 @@ Monorepo 根工程化已完成（SH-005）。
 ```text
 .
 ├─ apps/
-│  └─ soul-daemon/            # 生命周期与装配（SH-007A）。无认知循环，无 HTTP/WS
+│  └─ soul-daemon/            # 生命周期、Runtime 装配、本地 HTTP/WS/Health、Token。无认知循环
 ├─ packages/
 │  ├─ contracts/              # 协议契约包（SH-004，零运行时依赖）
 │  ├─ persistence/            # SQLite 持久化（SH-006A–D）
-│  └─ runtime/                # ID 分配、Persona 生命周期、进程内 Ingress、recoverRuntime、Scheduler。无检查点编排；Daemon 未装配
+│  └─ runtime/                # ID 分配、Persona 生命周期、进程内 Ingress、recoverRuntime、Scheduler。无检查点编排
 ├─ tools/consumer-check/      # 跨包导入验证：按包名导入 ESM + d.ts
 ├─ docs/                      # 架构文档（唯一基线）
 ├─ .github/workflows/ci.yml   # CI：format / lint / typecheck / test / build / consumer
@@ -65,14 +68,14 @@ Monorepo 根工程化已完成（SH-005）。
 └─ vitest.config.ts           # 统一测试入口（projects: packages/*、apps/*）
 ```
 
-`soul-studio` 与 `soul-cli` 尚未创建。
+`soul-studio` 与 `soul-cli` 尚未创建。**不存在 Soul Studio 应用**；`127.0.0.1:18701` 只是 Studio 预留开发端口。
 
 | 包 | 内容 | 状态 |
 |---|---|---|
 | [packages/contracts](packages/contracts/README.md) | 协议类型、10 份已注册 JSON Schema、枚举与标识符格式；双层信封（适配器输入层 / Ingress 归一化层）、零运行时依赖、无 IO、不生成 ID | **已实现（协议层，SH-004）**，含测试与正反 fixtures |
 | [packages/persistence](packages/persistence/README.md) | SQLite（WAL、单写入者）、Migration、事务协调器、六表 Repository、字段映射、Runtime checkpoint envelope 存取；其后另有 SH-008P 的分页与条件写原语、SH-008C 所用的会话复用与 P1 信封提交，以及 SH-008D D1 任务状态机 | **SH-006A–D 已完成**。后续提交不另计为 SH-006 验收。不重建 Runtime；无显式 `PRAGMA wal_checkpoint` |
-| [packages/runtime](packages/runtime/README.md) | 六类核心 ID 与辅助 ID（`tsk` / `cnf`）分配；进程内 Persona 生命周期；进程内 P1 Ingress；P1 `recoverRuntime`；进程内 Scheduler。无裸 SQL | **A / B：代码层面已交付。C：代码已合并。D1.R1 与 D3.R1：独立复审通过。D2：代码已实施，整体未正式关闭。D4 未开始，整批未验收。** 无扫描 A/B、无检查点编排。Daemon 未装配，不启动 Scheduler |
-| [apps/soul-daemon](apps/soul-daemon/README.md) | 配置、结构化日志、数据目录、单实例锁、打开 SQLite、Migration、启停状态机 | **已完成（SH-007A）**。不调用 Persona Recovery、Runtime Recovery、Event Bus 或 Scheduler。API 未实现 |
+| [packages/runtime](packages/runtime/README.md) | 六类核心 ID 与辅助 ID（`tsk` / `cnf`）分配；进程内 Persona 生命周期；进程内 P1 Ingress；P1 `recoverRuntime`；进程内 Scheduler。无裸 SQL | **SH-008D 已完成并通过独立复审与整批验收。** 无扫描 A/B、无检查点编排。SH-008E 已把 Persona Recovery / Runtime Recovery / Ingress / Scheduler 装配到 Daemon；Scheduler Handler Map 仍为空 |
+| [apps/soul-daemon](apps/soul-daemon/README.md) | 配置、结构化日志、数据目录、单实例锁、SQLite/Migration、Persona/Runtime Recovery、Ingress、空 Handler Scheduler、本地 HTTP/WebSocket/Health、Token 文件、Persona 管理与状态查询 | **SH-007A 生命周期完成；SH-008E 装配已实施/合并，整批等待最终独立验收签署；SH-009 E1–E4、E5.P0、E5A 已通过独立复审，整批未验收。** Scheduler 不派发任务；API 不是 Stimulus transport；无认知循环 |
 
 ## 旧系统
 
