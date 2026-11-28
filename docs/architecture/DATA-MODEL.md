@@ -716,19 +716,48 @@ CREATE UNIQUE INDEX ux_conflict_delivery
 
 ## 6. 版本与纪元
 
-三个独立版本各自维护，**不许合并成一个计数器**：
+四个版本 / 纪元概念各自维护，**不许合并成一个计数器，也不许混淆作用域**：
 
-| 字段 | 作用 | 变化时机 |
-|---|---|---|
-| `state_version` | 乐观并发控制 | 每次成功提交 +1 |
-| `epoch`（Persona） | 内容纪元 / 恢复下限 | 遗忘时 +1，只增不减 |
-| `intent_version` | 场景/意图版本 | 意图变更时更新；过期意图不得执行动作 |
+| 概念 | 作用域 | 语义 | 变化 / 规则 | 当前 P1 事实 |
+|---|---|---|---|---|
+| `state_version` | 目标实体 / 记录级 OCC | 乐观并发版本 | 该领域每次成功提交 +1；只在适用的实体上使用 | 当前 P1 没有统一名为 `state_version` 的列；`personas` 使用 `version`，其余 P1 表的条件写见 §6.2 |
+| Persona `epoch` | 人格级内容纪元 / 恢复下限 | 遗忘代际与旧结果隔离 | 遗忘时 +1，只增不减；旧检查点低于当前 epoch 不得复活内容 | `personas.epoch` 与 `runtime_state.epoch` 已存在；checkpoint 必须与 `runtime_state.epoch` 一致 |
+| `memory_nodes.content_epoch` | 记忆节点级内容 / 索引新旧 | 节点内容与派生索引的一致性代际 | 节点内容或索引语义变化时更新；不得用 Persona `epoch` 代替 | 目标 Schema 字段；当前 P1 尚未创建 `memory_nodes` |
+| `action_records.intent_version` | 动作记录的意图版本 | 场景 / 意图版本；过期意图不得执行动作 | 意图实质变化时更新；新意图按 `IDENTITY-PROTOCOL.md §4.6` 分配新 `actionId` | 目标 Schema 字段；当前 P1 尚未创建 `action_records` |
 
-规则：
+`intent_version` **只属于 `action_records`**，不是所有认知实体或所有 Intent 对象的通用字段。`state_version` 也不是每张表当前都已具备的列；具体字段是否存在以本文件对应表定义和 §6.3 为准。
+
+### 6.1 目标 `base_version` 规则
+
+以下规则是**目标领域契约**，不得删除、弱化或改写；它们不表示当前 P1 的所有 Repository 已经实现统一 OCC：
 
 1. 任何写事务提交前校验 `base_version` 与当前一致，否则拒绝并要求重算。
 2. 恢复时取 `max(epoch)`；旧检查点的 `epoch` 低于当前 → **不得**越过墓碑复活内容。
 3. 迟到模型结果若 `base_epoch < 当前 epoch` → 直接丢弃，不合并。
+
+目标设计中的 `state_version`、Persona `epoch`、`memory_nodes.content_epoch` 与 `action_records.intent_version` 按各自粒度参与提交条件；并非每种提案都需要携带或比较全部版本字段，也不得用 Persona `epoch` 替代节点 `content_epoch`，或把 `intent_version` 当成通用实体版本。
+
+### 6.2 当前 P1 的实际条件写入边界
+
+以下只描述 `0001_init_core.sql` 已创建的 P1 六表。不得把下列条件写、唯一索引或状态谓词概括为统一 `state_version` CAS；也不得把目标表写成当前已实现能力。
+
+| 表 / 对象 | 当前实际字段 | 实际条件写 / 约束 | 不是统一 OCC 的部分 |
+|---|---|---|---|
+| `personas` | `version`、`epoch`；**没有** `state_version` 列 | `compareAndSetState` 与 `commitLifecycle` 使用 `state + version` 条件写，并递增 `version`；`updateState` 仅按 `id` 更新，递增 `version`，**不比较**预期状态或版本；当前源码未发现 `updateState` 调用者 | `updateState` 不是 CAS；不能把 `personas` 的所有写入都说成版本 CAS；`epoch` 不是通用 OCC |
+| `runtime_state` | `epoch`、`checkpoint_json`；**没有** `state_version` 列 | checkpoint `save()` 在写事务中先核对 `runtime_state.epoch` 与输入 `epoch` 一致，再写 `checkpoint_json`；通用 `upsert()` 按冲突更新 `state` / `boot_id` / `epoch` 等字段，**没有** CAS | checkpoint 的 epoch 检查不等于整个 `runtime_state` Repository 具备统一 OCC；`upsert()` 本身不是 CAS |
+| `sessions` | 无版本列 | `ux_sessions_external` 是部分唯一索引（仅 `closed_at IS NULL` 的有效映射）；查找有效会话使用 `persona_id + adapter_id + external_id + closed_at IS NULL`；关闭使用 `id + persona_id + closed_at IS NULL` 条件 | 唯一索引和有效会话谓词不是版本 CAS |
+| `events` | 无版本列 | P1 信封提交先在事务内插入 `received`，再用 `id + persona_id + status='received' + archive_state='none'` 更新到结果；`expireActive` / `rejectIfActive` 使用 `status IN ('received','accepted') + archive_state='none'` | 不同操作使用 `status` / `archive_state` 谓词，不是 `state_version` CAS |
+| `tasks` | 无版本列 | `claimNext` 使用 `state='queued'`、`attempt` 上限、`channel` 和 Persona `RUNNING`；`completeTask` / `failTask` 使用 `state='running' + run_id + attempt`；`setTaskState` 等按各自状态与 attempt 条件写 | 状态、`run_id`、`attempt` 谓词随操作而异，不能称为 `state_version` CAS |
+| `schema_migrations` | `version` 主键 | 迁移记录按 `version` 唯一；不是业务实体 OCC | 迁移版本不是业务乐观并发版本 |
+
+**验证路径（只读证据）：** `packages/persistence/migrations/0001_init_core.sql`；`packages/persistence/src/repositories/personas.ts`、`runtime-state.ts`、`checkpoint.ts`、`sessions.ts`、`events.ts`、`tasks.ts`；测试 `persona-lifecycle-write.test.ts`、`checkpoint.test.ts`、`event-write-boundary.test.ts`、`tasks-state.test.ts`、`conditional-update.test.ts`。
+
+### 6.3 目标 Schema 与 `thought_threads`
+
+- `memory_nodes`、`memory_edges`、`thought_threads`、`action_records`、`dream_sessions` 等是**目标 Schema**，当前 P1 Migration 尚未创建；不得把它们列入 P1 实际写入能力。
+- 目标 `memory_nodes` 同时设计 `content_epoch` 与 `state_version`；目标 `memory_edges` 只有 `state_version`；目标 `action_records` 只有 `intent_version`。这些是不同粒度的目标设计，不能互相替代。
+- 目标 `thought_threads` **确实有 `epoch` 字段**，但它不能直接等同于 Persona `epoch`。其 OCC 字段 / 并发控制方案仍归 **CA-OPEN-05**；本文件不为其指定 `state_version`，不新增字段，也不给出未裁决的 OCC 语义。
+- 目标表当前没有 Migration、Repository 或写入路径，无法运行时验证其版本 / OCC 行为；不得把目标设计写成已实现，也不得写成“已实现但仅缺证据”。
 
 ## 7. 一致性协议
 
