@@ -7,6 +7,8 @@
 **草案 SHA-256：** `227d315df8fe1a9e787a93e4657ddce4224b26614bc2fec843ff9480a8cdf26b`
 **E0 修正说明：** `F:\6\soul-harness-inputs\CA-DOC-02-E1-P0-E0-CORRECTION.md`
 
+> **归档说明（PR #24）：** 本报告生成时没有创建仓库 PR；它是 E1-P0.R1 的原始只读复核文本。后续仅为归档与独立审查，才通过 PR #24 将副本加入 `docs/reviews/CA-DOC-02/`。归档 PR 不代表 WP-1/WP-2/WP-3 已实施。
+
 ---
 
 ## 1. 固定前置与只读证明
