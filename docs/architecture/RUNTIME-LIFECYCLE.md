@@ -681,18 +681,23 @@ DECIDE_RESUME                  再决定是否继续睡眠
 任意状态
    │ 经验证的强制控制（独立来源 / 权限 / 目标 Persona 校验）
    ▼
-CONTROL_STATE_ADVANCE（立即推进权威生命周期 / 权限状态）
+CONTROL_STATE_ADVANCE（控制面状态转移，构成强制控制生效边界）
    ├─ 停止接纳新的普通睡眠工作
-   ├─ 使未提交睡眠提案失去提交资格
-   ├─ 梦境 outcome=INTERRUPTED；跳过 FRAGMENT_SELECTION；不生成醒后片段
+   ├─ 使未提交的普通睡眠提案与未提交的 FRAGMENT_SELECTION 提案失去提交资格
+   ├─ 若存在正在进行的梦境：outcome=INTERRUPTED；跳过 FRAGMENT_SELECTION（不开始新的选择）；不生成新的醒后片段
    └─ 若触发 Daemon shutdown → §3 物理关闭（可能阻塞，须如实暴露）
 ```
 
 1. 强制控制命令必须经过**独立来源鉴别、权限和目标 Persona 校验**；普通聊天正文或未经授权的模型提案不能升级为强制控制。
-2. 经验证的强制停止、撤权、Persona stop 或 Daemon shutdown，必须立即停止接纳新的普通睡眠工作，并使尚未提交的睡眠提案失去提交资格。
-3. 正在进行的梦境按 §4 既有规则以 `outcome=INTERRUPTED` 收束；**跳过 `FRAGMENT_SELECTION`，不生成醒后片段**。
-4. 对应的权威生命周期 / 权限控制面状态必须立即推进；不得等待片段选择、模型 Proposal、现实感知恢复或普通睡眠收尾。
-5. 若强制控制触发 Daemon shutdown，物理停机仍严格遵循 §3 的现有关闭顺序和失败保护：不绕过 `Scheduler.stop()`、Store 关闭或 Lock 释放保护，不引入未经裁决的 force-kill / `process.exit()` 路径。若不可取消或永不 settle 的 Handler 使物理关闭阻塞，必须如实暴露该限制，不得宣称资源已释放。
+2. 经验证的强制停止、撤权、Persona stop 或 Daemon shutdown，必须立即停止接纳新的普通睡眠工作，并使尚未提交的普通睡眠提案失去提交资格。
+3. 对应的权威生命周期 / 权限控制面状态必须立即推进；**该控制面状态转移构成强制控制的生效边界**。强制控制不得等待正在执行的片段选择、模型 Proposal、Handler、现实感知恢复或普通睡眠收尾。
+4. `FRAGMENT_SELECTION` 的提交资格按上述生效边界判定：
+   - 若片段选择结果已经在生效边界前**成功持久提交**，保留该已提交结果，不做追溯删除，也不再开始新的片段选择；
+   - 若生效边界到达时 `FRAGMENT_SELECTION` 尚未成功持久提交，其未提交 Proposal 必须失去提交资格；迟到结果不得在控制面转移后提交，也不再开始新的片段选择，不生成新的醒后片段。
+5. 若存在正在进行的梦境，按 §4 既有规则以 `outcome=INTERRUPTED` 收束；强制控制**跳过 `FRAGMENT_SELECTION`**（不开始新的选择），不生成新的醒后片段。
+6. 若强制控制触发 Daemon shutdown，物理停机仍严格遵循 §3 的现有关闭顺序和失败保护：不绕过 `Scheduler.stop()`、Store 关闭或 Lock 释放保护，不引入未经裁决的 force-kill / `process.exit()` 路径。若不可取消或永不 settle 的 Handler 使物理关闭阻塞，必须如实暴露该限制，不得宣称资源已释放。
+
+本节的“失去提交资格”是结果 fencing / 时间边界，不代表已实现 Handler 取消、模型请求终止、Scheduler 取消或硬超时。具体 fencing 字段、取消 API、超时机制和 Handler 中止算法仍归 CA-OPEN-04 / CA-OPEN-10 / CA-OPEN-11 裁决。
 
 **“控制面立即生效”与“物理资源已完成释放”是两个不同事实。** 前者不等待片段选择、模型或睡眠收尾；后者只在 §3 的关闭序列实际完成后才成立。不得让状态图或文字暗示两者同时完成。
 
@@ -703,7 +708,7 @@ CONTROL_STATE_ADVANCE（立即推进权威生命周期 / 权限状态）
 | 未唤醒 | 无反应，继续当前周期 |
 | 部分觉醒 | 提升注意，不中断周期 |
 | 完全觉醒 | 进入 §8.1 的正常醒后转换流程 |
-| 强制控制 | 进入 §8.2 的独立控制路径，跳过 `FRAGMENT_SELECTION`，以 `INTERRUPTED` 收束，不生成醒后片段 |
+| 强制控制 | 进入 §8.2 的独立控制路径；控制面立即生效；**跳过 `FRAGMENT_SELECTION`**（不开始新的选择）；若存在正在进行的梦境则以 `INTERRUPTED` 收束；不生成新的醒后片段 |
 
 ### 8.4 未决事项
 
